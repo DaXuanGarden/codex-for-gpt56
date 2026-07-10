@@ -1,16 +1,8 @@
-# 公众号推文：Codex 没有 GPT-5.6？开源 Skill 一键修复
+# Codex 没有 GPT-5.6？开源 Skill 一键修复
 
-## 标题
+最近在使用 Codex 桌面端时，我遇到了一个问题：
 
-Codex 没有 GPT-5.6？开源 Skill 一键修复
-
-## 封面小标题
-
-把下面这段 Prompt 发给 Codex，让它自己安装 Skill、复制应用、打补丁、验证模型。
-
-## 正文
-
-如果你最近打开 Codex 桌面端，发现模型列表里没有 GPT-5.6，大概率不是你眼花。
+GPT-5.6 明明已经上线了，但我的 Codex 模型选择器里就是看不到。
 
 GPT-5.6 这次对应的是三个模型：
 
@@ -20,13 +12,10 @@ GPT-5.6 这次对应的是三个模型：
 
 但在一些 Codex/ChatGPT 桌面端版本里，底层模型目录、前端模型筛选、reasoning effort 展示并没有完全同步。结果就是：模型可能已经在你的使用环境里可用，前端却没有把它展示出来。
 
-我自己遇到的情况就是这样。模型能力到了，选择器没跟上。
-
 所以我整理了一个开源 Codex Skill：`codex-for-gpt56`。
 
-项目地址：
-
-https://github.com/DaXuanGarden/codex-for-gpt56
+> 项目地址：
+> `https://github.com/DaXuanGarden/codex-for-gpt56`
 
 它的目标很简单：让 Codex 自己修 Codex。
 
@@ -104,7 +93,13 @@ Windows 默认生成：
 %USERPROFILE%\Desktop\Codex for GPT-5.6.lnk
 ```
 
-状态文件、报告和隔离 user data 会放在 `~/.codex/codex-for-gpt56`。桌面入口会打开修复后的本地副本。原本安装的 Codex/ChatGPT App 仍然保留，后续如果官方 App 更新了，也可以重新运行这个 Skill，再基于新版重新生成一次。
+状态文件、报告和隔离 user data 会放在：
+
+```text
+~/.codex/codex-for-gpt56
+```
+
+桌面入口会打开修复后的本地副本。原本安装的 Codex/ChatGPT App 仍然保留，后续如果官方 App 更新了，也可以重新运行这个 Skill，再基于新版重新生成一次。
 
 ## 为什么用 Skill 会更稳
 
@@ -127,8 +122,46 @@ Codex 桌面端的前端资源通常会带 hash。版本一变，文件名也会
 
 如果你也遇到 Codex 桌面端看不到 GPT-5.6 的问题，可以直接把上面的 Prompt 丢给 Codex。
 
-项目地址：
+> 项目地址：
+> `https://github.com/DaXuanGarden/codex-for-gpt56`
 
-https://github.com/DaXuanGarden/codex-for-gpt56
+欢迎大家试用、反馈和一起改进。如果遇到问题，或者有更好的兼容方案，欢迎到 GitHub 提 Issue：
 
-让 Codex 自己安装 Skill，再让 Codex 自己修 Codex。这个体验还挺符合它的气质。
+```text
+https://github.com/DaXuanGarden/codex-for-gpt56/issues
+```
+
+如果这个 Skill 对你有帮助，也欢迎点赞、收藏、转发，让更多遇到同样问题的人能少踩一点坑。这个项目还会继续迭代，欢迎一起建设。
+
+# 分享一个超酷的 Codex 宠物
+
+顺手再分享一个最近装上的小东西：Codex 宠物「篮球小鸡」。
+
+它是一只篮球主题的小鸡宠物，适合放在 Codex Desktop / Petdex Desktop 里当小陪伴。写代码、学习或工作时，桌面上多一个小宠物，确实会轻松一点。
+
+![](https://files.mdnice.com/user/40759/02f2d6a2-2a53-4a95-9de1-f5d611b601e3.png)
+
+安装方式很简单，在终端运行：
+
+```bash
+npx petdex install basketball-chick
+```
+
+安装完成后，可以在 Codex Desktop 中这样启用：
+
+```text
+Settings -> Appearance -> Pets
+```
+
+如果你使用 Petdex Desktop，也可以右键桌面宠物进行切换和启用。
+
+安装后宠物文件会放在：
+
+```text
+~/.petdex/pets/   # Petdex Desktop
+~/.codex/pets/    # Codex Desktop
+```
+
+宠物名称是「篮球小鸡」，英文包名是 `basketball-chick`。
+
+喜欢可爱桌宠、篮球主题小装饰，或者想让开发环境多一点陪伴感的话，可以试试这个。
