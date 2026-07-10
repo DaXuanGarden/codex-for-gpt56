@@ -17,14 +17,16 @@ function usage() {
   console.log(`Usage: patch-codex-for-gpt56.mjs [options]
 
 Options:
-  --root <path>                  State/report root (default: ~/.codex/codex-for-gpt56)
+  --root <path>                  State/report root; also app parent when --app-parent is omitted
   --app-parent <path>            Folder for the copied app (default: source app's parent when writable)
   --name <name>                  App/display name (default: Codex for GPT-5.6)
   --source-app <path>            Source app bundle/folder/exe to copy
+  --dry-run                      Inspect inputs, outputs, and conflicts without writing files
+  --replace                      Replace existing generated app and launchers
   --launch                       Launch after patching
   --no-desktop                   Do not create a Desktop launcher/link
   --verify-wire                  Optional mock /v1/responses request capture
-  --with-plugin-marketplace      Validate plugin-account.json for optional plugin sync
+  --with-plugin-marketplace      Validate plugin-account.json only; no plugin sync is performed
   --plugin-account <path>        Path to plugin-account.json
   -h, --help                     Show this help
 `);
@@ -37,6 +39,8 @@ function parseArgs(argv) {
     appParent: "",
     name: DEFAULT_NAME,
     sourceApp: process.env.CODEX_SOURCE_APP || "",
+    dryRun: false,
+    replace: false,
     launch: false,
     desktop: true,
     verifyWire: false,
@@ -58,6 +62,8 @@ function parseArgs(argv) {
     else if (arg === "--app-parent") opts.appParent = readValue();
     else if (arg === "--name") opts.name = readValue();
     else if (arg === "--source-app") opts.sourceApp = readValue();
+    else if (arg === "--dry-run") opts.dryRun = true;
+    else if (arg === "--replace") opts.replace = true;
     else if (arg === "--launch") opts.launch = true;
     else if (arg === "--no-desktop") opts.desktop = false;
     else if (arg === "--verify-wire") opts.verifyWire = true;
@@ -72,6 +78,7 @@ function parseArgs(argv) {
   }
   opts.root = opts.root ? expandHome(opts.root) : defaultStateRoot();
   opts.appParent = opts.appParent ? expandHome(opts.appParent) : "";
+  opts.name = validateAppName(opts.name);
   opts.pluginAccount = opts.pluginAccount ? expandHome(opts.pluginAccount) : path.join(opts.root, "plugin-account.json");
   return opts;
 }
@@ -80,6 +87,20 @@ function expandHome(value) {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/") || value.startsWith("~\\")) return path.join(os.homedir(), value.slice(2));
   return path.resolve(value);
+}
+
+function validateAppName(value) {
+  const name = String(value).trim();
+  if (
+    name.length === 0
+    || name !== value
+    || name === "."
+    || name === ".."
+    || /[<>:"/\\|?*\u0000-\u001F]/.test(name)
+  ) {
+    throw new Error("--name must be a non-empty app name without path separators or reserved filename characters");
+  }
+  return name;
 }
 
 function run(command, args, options = {}) {
@@ -215,6 +236,7 @@ function platformPaths(opts, sourceApp) {
   const appParent = resolveAppParent(opts, sourceApp);
   if (process.platform === "darwin") {
     const targetApp = path.join(appParent, `${opts.name}.app`);
+    assertOutputPathInside(appParent, targetApp);
     return {
       appParent,
       targetApp,
@@ -225,6 +247,7 @@ function platformPaths(opts, sourceApp) {
     };
   }
   const targetApp = path.join(appParent, opts.name);
+  assertOutputPathInside(appParent, targetApp);
   return {
     appParent,
     targetApp,
@@ -268,24 +291,99 @@ function resolveAppParent(opts, sourceApp) {
   return path.join(opts.root, "app");
 }
 
+function assertOutputPathInside(parent, target) {
+  const relative = path.relative(path.resolve(parent), path.resolve(target));
+  if (relative.length === 0 || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Refusing an output path outside its app parent: ${target}`);
+  }
+}
+
+function canonicalPath(input) {
+  let existing = path.resolve(input);
+  const missing = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    missing.unshift(path.basename(existing));
+    existing = parent;
+  }
+  const resolved = fs.existsSync(existing) ? fs.realpathSync.native(existing) : existing;
+  return path.join(resolved, ...missing);
+}
+
+function comparablePath(input) {
+  const resolved = canonicalPath(input);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isSameOrChild(candidate, parent) {
+  const childPath = comparablePath(candidate);
+  const parentPath = comparablePath(parent);
+  return childPath === parentPath || childPath.startsWith(`${parentPath}${path.sep}`);
+}
+
+function assertRepairPathsSafe(sourceApp, root, targetApp) {
+  if (isSameOrChild(root, sourceApp)) {
+    throw new Error(`--root must not be inside the original app: ${root}`);
+  }
+  if (isSameOrChild(targetApp, sourceApp) || isSameOrChild(sourceApp, targetApp)) {
+    throw new Error(`Copied app target must not overlap the original app: ${targetApp}`);
+  }
+}
+
 function firstExisting(candidates) {
   return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
 }
 
-function copyApp(sourceApp, targetApp) {
+function copyApp(sourceApp, targetApp, { replace }) {
   assertCopyTargetSafe(sourceApp, targetApp);
-  fs.rmSync(targetApp, { recursive: true, force: true });
+  if (fs.existsSync(targetApp)) {
+    if (!replace) throw new Error(`Target app already exists: ${targetApp}. Re-run with --replace to overwrite it.`);
+    fs.rmSync(targetApp, { recursive: true, force: true });
+  }
   fs.mkdirSync(path.dirname(targetApp), { recursive: true });
   if (process.platform === "darwin") run("ditto", [sourceApp, targetApp], { stdio: "inherit" });
   else fs.cpSync(sourceApp, targetApp, { recursive: true, force: true });
 }
 
 function assertCopyTargetSafe(sourceApp, targetApp) {
-  const source = path.resolve(sourceApp);
-  const target = path.resolve(targetApp);
-  if (target === source || target.startsWith(`${source}${path.sep}`)) {
-    throw new Error(`Refusing to copy into or over the original app: ${target}`);
+  if (isSameOrChild(targetApp, sourceApp) || isSameOrChild(sourceApp, targetApp)) {
+    throw new Error(`Refusing to copy into or over the original app: ${targetApp}`);
   }
+}
+
+function expectedOutputPaths(opts, paths) {
+  const outputs = [paths.targetApp];
+  if (process.platform === "darwin") {
+    outputs.push(path.join(opts.root, `${opts.name}.command`));
+    if (opts.desktop) outputs.push(path.join(os.homedir(), "Desktop", `${opts.name}.app`));
+  } else if (process.platform === "win32") {
+    outputs.push(path.join(opts.root, `${opts.name}.cmd`));
+    if (opts.desktop) {
+      outputs.push(path.join(os.homedir(), "Desktop", `${opts.name}.lnk`));
+      outputs.push(path.join(os.homedir(), "Desktop", `${opts.name}.cmd`));
+    }
+  }
+  return outputs;
+}
+
+function assertOutputsAvailable(opts, paths) {
+  const existing = expectedOutputPaths(opts, paths).filter((output) => fs.existsSync(output));
+  if (existing.length > 0 && !opts.replace) {
+    throw new Error(`Output already exists: ${existing.join(", ")}. Re-run with --replace to overwrite generated output.`);
+  }
+  return existing;
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function removeExistingOutput(file, { replace }) {
+  if (!fs.existsSync(file)) return;
+  if (!replace) throw new Error(`Output already exists: ${file}. Re-run with --replace to overwrite it.`);
+  fs.rmSync(file, { recursive: true, force: true });
 }
 
 function plistSet(plist, key, value) {
@@ -318,16 +416,19 @@ function download(url) {
   });
 }
 
-async function writeModelCatalog(modelCatalogPath) {
+async function fetchModelCatalog() {
   const text = await download(MODEL_CATALOG_URL);
   const parsed = JSON.parse(text);
   if (!Array.isArray(parsed.models)) throw new Error("Official model catalog does not contain models[]");
   for (const slug of REQUIRED_MODELS) {
     if (!parsed.models.some((model) => model.slug === slug)) throw new Error(`Official model catalog is missing ${slug}`);
   }
-  fs.mkdirSync(path.dirname(modelCatalogPath), { recursive: true });
-  fs.writeFileSync(modelCatalogPath, `${JSON.stringify(parsed, null, 2)}\n`);
   return parsed;
+}
+
+function writeModelCatalog(modelCatalogPath, modelCatalog) {
+  fs.mkdirSync(path.dirname(modelCatalogPath), { recursive: true });
+  fs.writeFileSync(modelCatalogPath, `${JSON.stringify(modelCatalog, null, 2)}\n`);
 }
 
 function codexHomeDir() {
@@ -377,26 +478,39 @@ function updateCodexConfig(modelCatalogPath) {
   return { configPath, backupPath };
 }
 
-function writeMacLauncher(root, targetApp, name) {
+function shSingle(value) {
+  return `'${String(value).replace(/'/g, "'\"'\"'")}'`;
+}
+
+function writeMacLauncher(root, targetApp, name, options) {
   const launcher = path.join(root, `${name}.command`);
   const userData = path.join(root, "user-data");
   const content = `#!/usr/bin/env bash
 set -euo pipefail
-USER_DATA=${JSON.stringify(userData)}
+USER_DATA=${shSingle(userData)}
 mkdir -p "$USER_DATA"
-open -n ${JSON.stringify(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
+open -n ${shSingle(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
 `;
+  removeExistingOutput(launcher, options);
   fs.writeFileSync(launcher, content, { mode: 0o755 });
   fs.chmodSync(launcher, 0o755);
   return launcher;
 }
 
-function writeWindowsLauncher(root, targetApp, name) {
+function cmdEscape(value) {
+  return String(value)
+    .replace(/\^/g, "^^")
+    .replace(/%/g, "%%")
+    .replace(/[&|<>()]/g, "^$&");
+}
+
+function writeWindowsLauncher(root, targetApp, name, options) {
   const exe = findWindowsAppExe(targetApp);
   if (exe == null) throw new Error(`Could not find copied Windows app exe in ${targetApp}`);
   const launcher = path.join(root, `${name}.cmd`);
   const userData = path.join(root, "user-data");
-  const content = `@echo off\r\nset "USER_DATA=${userData}"\r\nif not exist "%USER_DATA%" mkdir "%USER_DATA%"\r\nstart "" "${exe}" --user-data-dir="%USER_DATA%" %*\r\n`;
+  const content = `@echo off\r\nsetlocal DisableDelayedExpansion\r\nset "USER_DATA=${cmdEscape(userData)}"\r\nif not exist "%USER_DATA%" mkdir "%USER_DATA%"\r\nstart "" "${cmdEscape(exe)}" --user-data-dir="%USER_DATA%" %*\r\n`;
+  removeExistingOutput(launcher, options);
   fs.writeFileSync(launcher, content);
   return { launcher, exe, userData };
 }
@@ -420,7 +534,7 @@ ${body}
 `;
 }
 
-function createMacLauncherApp(root, targetApp, name) {
+function createMacLauncherApp(root, targetApp, name, options) {
   const desktop = path.join(os.homedir(), "Desktop");
   const launcherApp = path.join(desktop, `${name}.app`);
   const contents = path.join(launcherApp, "Contents");
@@ -429,7 +543,7 @@ function createMacLauncherApp(root, targetApp, name) {
   const executableName = `${appSlug(name)}-launcher`;
   const userData = path.join(root, "user-data");
   fs.mkdirSync(desktop, { recursive: true });
-  if (fs.existsSync(launcherApp)) fs.rmSync(launcherApp, { recursive: true, force: true });
+  removeExistingOutput(launcherApp, options);
   fs.mkdirSync(macos, { recursive: true });
   fs.mkdirSync(resources, { recursive: true });
 
@@ -458,9 +572,9 @@ function createMacLauncherApp(root, targetApp, name) {
     executable,
     `#!/usr/bin/env bash
 set -euo pipefail
-USER_DATA=${JSON.stringify(userData)}
+USER_DATA=${shSingle(userData)}
 mkdir -p "$USER_DATA"
-open -n ${JSON.stringify(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
+open -n ${shSingle(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
 `,
     { mode: 0o755 },
   );
@@ -469,10 +583,10 @@ open -n ${JSON.stringify(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
   return { type: "mac-launcher-app", path: launcherApp, status: "created", targetApp, userData };
 }
 
-function createDesktopEntry(root, targetApp, name) {
+function createDesktopEntry(root, targetApp, name, options) {
   if (process.platform === "darwin") {
     try {
-      return createMacLauncherApp(root, targetApp, name);
+      return createMacLauncherApp(root, targetApp, name, options);
     } catch (error) {
       return { type: "mac-launcher-app", path: path.join(os.homedir(), "Desktop", `${name}.app`), status: "failed", error: error.message };
     }
@@ -481,9 +595,11 @@ function createDesktopEntry(root, targetApp, name) {
   if (process.platform === "win32") {
     const desktop = path.join(os.homedir(), "Desktop");
     const shortcut = path.join(desktop, `${name}.lnk`);
+    const fallback = path.join(desktop, `${name}.cmd`);
     const exe = findWindowsAppExe(targetApp);
     const userData = path.join(root, "user-data");
     if (exe == null) return { type: "windows-lnk", path: shortcut, status: "failed", error: "missing exe" };
+    removeExistingOutput(shortcut, options);
     const ps = [
       "$w = New-Object -ComObject WScript.Shell",
       `$s = $w.CreateShortcut(${psSingle(shortcut)})`,
@@ -494,18 +610,21 @@ function createDesktopEntry(root, targetApp, name) {
       "$s.Save()",
     ].join("; ");
     const result = run("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], { allowFailure: true });
-    if (result.status === 0) return { type: "windows-lnk", path: shortcut, status: "created" };
-    const fallback = path.join(desktop, `${name}.cmd`);
-    fs.writeFileSync(fallback, `@echo off\r\nstart "" "${exe}" --user-data-dir="${userData}" %*\r\n`);
+    if (result.status === 0) {
+      removeExistingOutput(fallback, options);
+      return { type: "windows-lnk", path: shortcut, status: "created" };
+    }
+    removeExistingOutput(fallback, options);
+    fs.writeFileSync(fallback, `@echo off\r\nsetlocal DisableDelayedExpansion\r\nstart "" "${cmdEscape(exe)}" --user-data-dir="${cmdEscape(userData)}" %*\r\n`);
     return { type: "windows-lnk", path: shortcut, status: "failed-fallback-cmd-created", fallback, error: result.stderr.trim() };
   }
 
   return { type: "desktop", status: "skipped" };
 }
 
-function writeLauncher(root, targetApp, name) {
-  if (process.platform === "darwin") return { launcher: writeMacLauncher(root, targetApp, name) };
-  if (process.platform === "win32") return writeWindowsLauncher(root, targetApp, name);
+function writeLauncher(root, targetApp, name, options) {
+  if (process.platform === "darwin") return { launcher: writeMacLauncher(root, targetApp, name, options) };
+  if (process.platform === "win32") return writeWindowsLauncher(root, targetApp, name, options);
   throw new Error(`Unsupported platform for launcher: ${process.platform}`);
 }
 
@@ -768,6 +887,7 @@ async function verifyWire(codexPath, modelCatalogPath) {
   if (sol.service_tier !== "priority") throw new Error(`Sol wire service_tier mismatch: ${sol.service_tier}`);
   return {
     requested: true,
+    status: "passed",
     baseUrl,
     capturedCount: captures.length,
     terra: { model: terra.model, reasoning: terra.reasoning, service_tier: terra.service_tier },
@@ -775,14 +895,52 @@ async function verifyWire(codexPath, modelCatalogPath) {
   };
 }
 
+function dryRunPlan(opts, sourceApp, paths, modelCatalogPath, pluginMarketplace) {
+  const configPath = path.join(codexHomeDir(), "config.toml");
+  const existingOutputs = expectedOutputPaths(opts, paths).filter((output) => fs.existsSync(output));
+  return {
+    dryRun: true,
+    platform: process.platform,
+    sourceApp,
+    targetApp: paths.targetApp,
+    stateRoot: opts.root,
+    modelCatalogPath,
+    configPath,
+    desktopLauncherRequested: opts.desktop,
+    existingOutputs,
+    requiresReplace: existingOutputs.length > 0,
+    globalConfigChanges: {
+      model_catalog_json: modelCatalogPath,
+      model_reasoning_effort: "xhigh when absent",
+      service_tier: "priority when absent",
+    },
+    networkRequirements: {
+      modelCatalog: MODEL_CATALOG_URL,
+      asarTool: "npx --yes @electron/asar",
+    },
+    pluginMarketplace,
+  };
+}
+
+function writeFailureReport(reportPath, details) {
+  const failureReportPath = path.join(path.dirname(reportPath), "repair-failure-report.json");
+  writeJson(failureReportPath, {
+    generatedAt: new Date().toISOString(),
+    status: "failed",
+    skill: SKILL_ID,
+    previousSuccessfulReportPath: fs.existsSync(reportPath) ? reportPath : null,
+    ...details,
+  });
+  return failureReportPath;
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   requireCommand("node");
-  requireCommand("npx");
-  if (process.platform === "darwin") requireCommand("ditto");
-
   const sourceApp = findSourceApp(opts.sourceApp);
   const paths = platformPaths(opts, sourceApp);
+  assertRepairPathsSafe(sourceApp, opts.root, paths.targetApp);
+  const pluginMarketplace = opts.withPluginMarketplace ? validatePluginAccount(opts.pluginAccount) : { requested: false, status: "skipped" };
   const work = path.join(opts.root, ".patch-work");
   const unpacked = path.join(work, "unpacked");
   const packedAsar = path.join(work, "app.asar");
@@ -790,36 +948,109 @@ async function main() {
   const modelCatalogReportCopy = path.join(opts.root, "model-catalog.json");
   const reportPath = path.join(opts.root, "repair-report.json");
 
-  copyApp(sourceApp, paths.targetApp);
-  const appIdentity = updateAppIdentity(paths.targetApp, opts);
-  const backupAsar = `${paths.targetAsar}.orig.bak`;
-  fs.copyFileSync(paths.targetAsar, backupAsar);
+  if (opts.dryRun) {
+    console.log(JSON.stringify(dryRunPlan(opts, sourceApp, paths, modelCatalogPath, pluginMarketplace), null, 2));
+    return;
+  }
+
+  requireCommand("npx");
+  if (process.platform === "darwin") requireCommand("ditto");
+  assertOutputsAvailable(opts, paths);
+
+  const sourceAsarSha256 = sha256(paths.sourceAsar);
 
   fs.rmSync(work, { recursive: true, force: true });
   fs.mkdirSync(unpacked, { recursive: true });
-  run("npx", ["--yes", "@electron/asar", "extract", paths.targetAsar, unpacked], { stdio: "inherit" });
+  run("npx", ["--yes", "@electron/asar", "extract", paths.sourceAsar, unpacked], { stdio: "inherit" });
   const jsPatch = patchJsTree(unpacked);
+  if (jsPatch.missing.length > 0) {
+    writeFailureReport(reportPath, {
+      failureStage: "patch-analysis",
+      platform: process.platform,
+      stateRoot: opts.root,
+      sourceApp,
+      targetApp: paths.targetApp,
+      sourceAsarSha256,
+      jsPatch,
+      globalConfigChanged: false,
+    });
+    throw new Error(`Required WebView patch points are missing: ${jsPatch.missing.join(", ")}. No copied app or global Codex config was changed.`);
+  }
   const jsChecked = checkPatchedJs(unpacked, jsPatch);
   run("npx", ["--yes", "@electron/asar", "pack", unpacked, packedAsar], { stdio: "inherit" });
-  fs.copyFileSync(packedAsar, paths.targetAsar);
+  const asarList = validateAsarList(packedAsar);
+  const packedAsarSha256 = sha256(packedAsar);
+  const modelCatalog = await fetchModelCatalog();
 
-  const modelCatalog = await writeModelCatalog(modelCatalogPath);
+  copyApp(sourceApp, paths.targetApp, opts);
+  const appIdentity = updateAppIdentity(paths.targetApp, opts);
+  const backupAsar = `${paths.targetAsar}.orig.bak`;
+  fs.copyFileSync(paths.targetAsar, backupAsar);
+  fs.copyFileSync(packedAsar, paths.targetAsar);
+  const targetAsarSha256 = sha256(paths.targetAsar);
+  if (packedAsarSha256 !== targetAsarSha256) {
+    writeFailureReport(reportPath, {
+      failureStage: "copy-patched-asar",
+      platform: process.platform,
+      stateRoot: opts.root,
+      sourceApp,
+      targetApp: paths.targetApp,
+      sourceAsarSha256,
+      packedAsarSha256,
+      targetAsarSha256,
+      jsPatch,
+      globalConfigChanged: false,
+    });
+    throw new Error("Packed app.asar SHA does not match target app.asar. No global Codex config was changed.");
+  }
+
+  const signing = signAndVerify(paths.targetApp);
+  if (!signing.skipped && !signing.ok) {
+    writeFailureReport(reportPath, {
+      failureStage: "signing",
+      platform: process.platform,
+      stateRoot: opts.root,
+      sourceApp,
+      targetApp: paths.targetApp,
+      sourceAsarSha256,
+      packedAsarSha256,
+      targetAsarSha256,
+      jsPatch,
+      signing,
+      globalConfigChanged: false,
+    });
+    throw new Error("Copied app signature verification failed. No global Codex config was changed.");
+  }
+
+  let debugModels;
+  try {
+    debugModels = parseDebugModels(paths.codexPath);
+    assertModelRequirements(debugModels);
+  } catch (error) {
+    writeFailureReport(reportPath, {
+      failureStage: "model-validation",
+      platform: process.platform,
+      stateRoot: opts.root,
+      sourceApp,
+      targetApp: paths.targetApp,
+      sourceAsarSha256,
+      packedAsarSha256,
+      targetAsarSha256,
+      jsPatch,
+      signing,
+      globalConfigChanged: false,
+      error: error.message,
+    });
+    throw error;
+  }
+
+  const launcherInfo = writeLauncher(opts.root, paths.targetApp, opts.name, opts);
+  const desktopEntry = opts.desktop ? createDesktopEntry(opts.root, paths.targetApp, opts.name, opts) : { status: "skipped" };
+  writeModelCatalog(modelCatalogPath, modelCatalog);
   fs.mkdirSync(path.dirname(modelCatalogReportCopy), { recursive: true });
   fs.copyFileSync(modelCatalogPath, modelCatalogReportCopy);
   const configUpdate = updateCodexConfig(modelCatalogPath);
-  const launcherInfo = writeLauncher(opts.root, paths.targetApp, opts.name);
-  const desktopEntry = opts.desktop ? createDesktopEntry(opts.root, paths.targetApp, opts.name) : { status: "skipped" };
-  const signing = signAndVerify(paths.targetApp);
-  const asarList = validateAsarList(paths.targetAsar);
-  const sourceAsarSha256 = sha256(paths.sourceAsar);
-  const packedAsarSha256 = sha256(packedAsar);
-  const targetAsarSha256 = sha256(paths.targetAsar);
-  if (packedAsarSha256 !== targetAsarSha256) throw new Error("Packed app.asar SHA does not match target app.asar");
 
-  const debugModels = parseDebugModels(paths.codexPath);
-  assertModelRequirements(debugModels);
-
-  const pluginMarketplace = opts.withPluginMarketplace ? validatePluginAccount(opts.pluginAccount) : { requested: false, status: "skipped" };
   let wireVerification = { requested: false, status: "skipped" };
   if (opts.verifyWire) {
     try {
@@ -829,13 +1060,31 @@ async function main() {
     }
   }
 
+  let launch = { requested: opts.launch, status: opts.launch ? "failed" : "skipped" };
   if (opts.launch) {
-    if (process.platform === "darwin") run("open", ["-n", paths.targetApp, "--args", `--user-data-dir=${path.join(opts.root, "user-data")}`], { stdio: "inherit" });
-    else if (process.platform === "win32") run(launcherInfo.exe, [`--user-data-dir=${launcherInfo.userData}`], { stdio: "inherit", allowFailure: true });
+    try {
+      if (process.platform === "darwin") {
+        run("open", ["-n", paths.targetApp, "--args", `--user-data-dir=${path.join(opts.root, "user-data")}`], { stdio: "inherit" });
+        launch = { requested: true, status: "started" };
+      } else if (process.platform === "win32") {
+        const result = run(launcherInfo.exe, [`--user-data-dir=${launcherInfo.userData}`], { stdio: "inherit", allowFailure: true });
+        launch = result.status === 0 ? { requested: true, status: "started" } : { requested: true, status: "failed", error: result.stderr?.trim() };
+      }
+    } catch (error) {
+      launch = { requested: true, status: "failed", error: error.message };
+    }
   }
+
+  const warnings = [];
+  if (opts.desktop && !["created", "skipped"].includes(desktopEntry.status)) warnings.push(`Desktop launcher: ${desktopEntry.status}`);
+  if (signing.skipped && process.platform === "darwin") warnings.push("macOS signing verification was skipped");
+  if (wireVerification.status === "failed") warnings.push("Optional wire verification failed");
+  if (launch.status === "failed") warnings.push("Requested app launch failed");
 
   const report = {
     generatedAt: new Date().toISOString(),
+    status: warnings.length === 0 ? "success" : "completed-with-warnings",
+    warnings,
     platform: process.platform,
     skill: SKILL_ID,
     appName: opts.name,
@@ -853,6 +1102,7 @@ async function main() {
     configBackupPath: configUpdate.backupPath,
     modelCatalogPath,
     modelCatalogReportCopy,
+    modelCatalogSource: MODEL_CATALOG_URL,
     modelCatalogModelCount: modelCatalog.models.length,
     sourceAsarSha256,
     packedAsarSha256,
@@ -864,10 +1114,11 @@ async function main() {
     debugModels,
     pluginMarketplace,
     wireVerification,
+    launch,
   };
-  fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  writeJson(reportPath, report);
 
-  console.log(`${opts.name} built successfully.`);
+  console.log(warnings.length === 0 ? `${opts.name} built successfully.` : `${opts.name} built with warnings.`);
   console.log(`Target app: ${paths.targetApp}`);
   console.log(`Launcher: ${launcherInfo.launcher}`);
   console.log(`Desktop: ${desktopEntry.path ?? desktopEntry.status}`);
