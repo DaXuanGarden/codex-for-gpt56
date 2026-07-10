@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex for GPT-5.6"
+  short_description: "Repair GPT-5.6 in Codex desktop"
+  default_prompt: "Use $codex-for-gpt56 to repair Codex desktop for GPT-5.6."
