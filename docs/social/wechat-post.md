@@ -92,17 +92,19 @@ $codex-for-gpt56 修复本机 Codex，让 GPT-5.6 显示出来
 macOS 默认生成：
 
 ```text
-~/Downloads/Report/CodexForGPT56/app/Codex for GPT-5.6.app
+/Applications/Codex for GPT-5.6.app
+如果 /Applications 不可写，则回退到 ~/Applications/Codex for GPT-5.6.app
 ~/Desktop/Codex for GPT-5.6.app
 ```
 
 Windows 默认生成：
 
 ```text
-%USERPROFILE%\Downloads\Report\CodexForGPT56
+%LOCALAPPDATA%\Programs\Codex for GPT-5.6
+%USERPROFILE%\Desktop\Codex for GPT-5.6.lnk
 ```
 
-桌面入口会打开修复后的本地副本。原本安装的 Codex/ChatGPT App 仍然保留，后续如果官方 App 更新了，也可以重新运行这个 Skill，再基于新版重新生成一次。
+状态文件、报告和隔离 user data 会放在 `~/.codex/codex-for-gpt56`。桌面入口会打开修复后的本地副本。原本安装的 Codex/ChatGPT App 仍然保留，后续如果官方 App 更新了，也可以重新运行这个 Skill，再基于新版重新生成一次。
 
 ## 为什么用 Skill 会更稳
 

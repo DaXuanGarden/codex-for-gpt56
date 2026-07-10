@@ -10,7 +10,6 @@ import path from "node:path";
 const REQUIRED_MODELS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const MODEL_CATALOG_URL = "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json";
 const DEFAULT_NAME = "Codex for GPT-5.6";
-const DEFAULT_ROOT = path.join(os.homedir(), "Downloads", "Report", "CodexForGPT56");
 const DEFAULT_BUNDLE_ID = "com.openai.codex.gpt56";
 const SKILL_ID = "codex-for-gpt56";
 
@@ -18,7 +17,8 @@ function usage() {
   console.log(`Usage: patch-codex-for-gpt56.mjs [options]
 
 Options:
-  --root <path>                  Output root (default: ~/Downloads/Report/CodexForGPT56)
+  --root <path>                  State/report root (default: ~/.codex/codex-for-gpt56)
+  --app-parent <path>            Folder for the copied app (default: source app's parent when writable)
   --name <name>                  App/display name (default: Codex for GPT-5.6)
   --source-app <path>            Source app bundle/folder/exe to copy
   --launch                       Launch after patching
@@ -32,7 +32,9 @@ Options:
 
 function parseArgs(argv) {
   const opts = {
-    root: DEFAULT_ROOT,
+    root: "",
+    rootProvided: false,
+    appParent: "",
     name: DEFAULT_NAME,
     sourceApp: process.env.CODEX_SOURCE_APP || "",
     launch: false,
@@ -49,7 +51,11 @@ function parseArgs(argv) {
       i += 1;
       return value;
     };
-    if (arg === "--root") opts.root = readValue();
+    if (arg === "--root") {
+      opts.root = readValue();
+      opts.rootProvided = true;
+    }
+    else if (arg === "--app-parent") opts.appParent = readValue();
     else if (arg === "--name") opts.name = readValue();
     else if (arg === "--source-app") opts.sourceApp = readValue();
     else if (arg === "--launch") opts.launch = true;
@@ -64,7 +70,8 @@ function parseArgs(argv) {
       throw new Error(`Unknown option: ${arg}`);
     }
   }
-  opts.root = expandHome(opts.root);
+  opts.root = opts.root ? expandHome(opts.root) : defaultStateRoot();
+  opts.appParent = opts.appParent ? expandHome(opts.appParent) : "";
   opts.pluginAccount = opts.pluginAccount ? expandHome(opts.pluginAccount) : path.join(opts.root, "plugin-account.json");
   return opts;
 }
@@ -205,7 +212,7 @@ function findWindowsSourceApp(sourceApp) {
 }
 
 function platformPaths(opts, sourceApp) {
-  const appParent = path.join(opts.root, "app");
+  const appParent = resolveAppParent(opts, sourceApp);
   if (process.platform === "darwin") {
     const targetApp = path.join(appParent, `${opts.name}.app`);
     return {
@@ -228,15 +235,57 @@ function platformPaths(opts, sourceApp) {
   };
 }
 
+function defaultStateRoot() {
+  return path.join(codexHomeDir(), SKILL_ID);
+}
+
+function isWritableDirectory(dir) {
+  try {
+    return fs.existsSync(dir) && fs.statSync(dir).isDirectory() && (fs.accessSync(dir, fs.constants.W_OK), true);
+  } catch {
+    return false;
+  }
+}
+
+function defaultMacAppParent(sourceApp) {
+  const sourceParent = path.dirname(sourceApp);
+  if (isWritableDirectory(sourceParent)) return sourceParent;
+  return path.join(os.homedir(), "Applications");
+}
+
+function defaultWindowsAppParent(sourceApp) {
+  const sourceParent = path.dirname(sourceApp);
+  if (!/\bWindowsApps\b/i.test(sourceParent) && isWritableDirectory(sourceParent)) return sourceParent;
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  return path.join(localAppData, "Programs");
+}
+
+function resolveAppParent(opts, sourceApp) {
+  if (opts.appParent) return opts.appParent;
+  if (opts.rootProvided) return path.join(opts.root, "app");
+  if (process.platform === "darwin") return defaultMacAppParent(sourceApp);
+  if (process.platform === "win32") return defaultWindowsAppParent(sourceApp);
+  return path.join(opts.root, "app");
+}
+
 function firstExisting(candidates) {
   return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
 }
 
 function copyApp(sourceApp, targetApp) {
+  assertCopyTargetSafe(sourceApp, targetApp);
   fs.rmSync(targetApp, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(targetApp), { recursive: true });
   if (process.platform === "darwin") run("ditto", [sourceApp, targetApp], { stdio: "inherit" });
   else fs.cpSync(sourceApp, targetApp, { recursive: true, force: true });
+}
+
+function assertCopyTargetSafe(sourceApp, targetApp) {
+  const source = path.resolve(sourceApp);
+  const target = path.resolve(targetApp);
+  if (target === source || target.startsWith(`${source}${path.sep}`)) {
+    throw new Error(`Refusing to copy into or over the original app: ${target}`);
+  }
 }
 
 function plistSet(plist, key, value) {
@@ -564,7 +613,7 @@ function checkPatchedJs(unpacked, jsReport) {
 
 function validateAsarList(targetAsar) {
   const list = run("npx", ["--yes", "@electron/asar", "list", targetAsar]).stdout;
-  const bad = list.split(/\n/).filter((line) => /app\.asar\.orig|\.bak|patch-work|CodexForGPT56|CodexCurrent|user-data/.test(line));
+  const bad = list.split(/\n/).filter((line) => /app\.asar\.orig|\.bak|patch-work|codex-for-gpt56|CodexForGPT56|CodexCurrent|user-data/.test(line));
   if (bad.length > 0) throw new Error(`Unexpected generated files inside app.asar: ${bad.join(", ")}`);
   return { checked: true };
 }
@@ -792,6 +841,9 @@ async function main() {
     appName: opts.name,
     appSlug: appSlug(opts.name),
     bundleId: process.platform === "darwin" ? DEFAULT_BUNDLE_ID : null,
+    stateRoot: opts.root,
+    appParent: paths.appParent,
+    rootProvided: opts.rootProvided,
     sourceApp,
     targetApp: paths.targetApp,
     launcher: launcherInfo.launcher,
