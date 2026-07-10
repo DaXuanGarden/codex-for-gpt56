@@ -11,6 +11,8 @@ Use this skill to create a local repaired desktop app from the user's own instal
 
 The bundled script supports macOS and Windows from one Node implementation. It copies the installed app, unpacks `app.asar`, applies feature-based WebView patches, repacks, updates Codex model catalog config, writes a report, and creates a Desktop launcher.
 
+Important safety detail: global `model_catalog_json` must point to `~/.codex/model-catalogs/codex-for-gpt56/model-catalog.json`, not to the generated output root under `~/Downloads/Report`. The output-root `model-catalog.json` is only a report copy. This prevents deleting the generated app directory from breaking native Codex task creation.
+
 ## Quick Start
 
 macOS:
@@ -38,7 +40,8 @@ Default outputs:
 
 - `~/Downloads/Report/CodexForGPT56/app/Codex for GPT-5.6.app` on macOS
 - `~/Downloads/Report/CodexForGPT56/app/Codex for GPT-5.6/` on Windows
-- `~/Downloads/Report/CodexForGPT56/model-catalog.json`
+- `~/.codex/model-catalogs/codex-for-gpt56/model-catalog.json`
+- `~/Downloads/Report/CodexForGPT56/model-catalog.json` as a report copy
 - `~/Downloads/Report/CodexForGPT56/repair-report.json`
 - A Desktop app link on macOS or Desktop `.lnk` on Windows
 
@@ -60,6 +63,8 @@ Default outputs:
 - Never modify the original installed app.
 - Never place the copied app bundle/folder inside this skill folder.
 - Never log access tokens, auth JSON contents, or API keys.
+- Never write global `model_catalog_json` to a temporary, report, Downloads, Desktop, app-copy, or user-data path.
+- Always back up `~/.codex/config.toml` before changing `model_catalog_json`.
 - Reject plugin credentials containing `sk-` values; remote plugin sync uses ChatGPT/Codex OAuth credentials only.
 - Preserve official behavior when a newer build no longer matches a patch point. The script records missing patch points instead of rewriting unknown code.
 
@@ -76,6 +81,8 @@ macOS:
 ```bash
 shasum -a 256 "$HOME/Downloads/Report/CodexForGPT56/.patch-work/app.asar" "$HOME/Downloads/Report/CodexForGPT56/app/Codex for GPT-5.6.app/Contents/Resources/app.asar"
 codesign --verify --deep --strict --verbose=2 "$HOME/Downloads/Report/CodexForGPT56/app/Codex for GPT-5.6.app"
+test -f "$HOME/.codex/model-catalogs/codex-for-gpt56/model-catalog.json"
+grep 'model_catalog_json' "$HOME/.codex/config.toml"
 ```
 
 Expected GPT-5.6 efforts:

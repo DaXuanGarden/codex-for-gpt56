@@ -9,7 +9,8 @@ This repository contains the skill only. It does not include a modified OpenAI a
 - macOS: `~/Downloads/Report/CodexForGPT56/app/Codex for GPT-5.6.app`
 - Windows: `%USERPROFILE%\Downloads\Report\CodexForGPT56\app\Codex for GPT-5.6`
 - Desktop launcher: `Codex for GPT-5.6`
-- Local model catalog: `model-catalog.json`
+- Stable model catalog: `~/.codex/model-catalogs/codex-for-gpt56/model-catalog.json`
+- Report copy of the model catalog: `~/Downloads/Report/CodexForGPT56/model-catalog.json`
 - Repair report: `repair-report.json`
 
 ## Install As A Codex Skill
@@ -61,6 +62,9 @@ node scripts/patch-codex-for-gpt56.mjs --verify-wire
 - The script copies the installed app and patches only the copy.
 - The original app in `/Applications` or `C:\Program Files\WindowsApps` is not modified.
 - The Desktop launcher uses an isolated user data directory for the repaired copy.
+- Global `model_catalog_json` points to `~/.codex/model-catalogs/codex-for-gpt56/model-catalog.json`, not the deletable output directory.
+- `config.toml` is backed up before the script changes `model_catalog_json`.
+- Deleting `~/Downloads/Report/CodexForGPT56` removes the generated app copy, but should not break native Codex task creation.
 - Remote plugin sync is disabled by default and must be explicitly requested.
 - Credentials containing `sk-` API keys are rejected for plugin sync.
 

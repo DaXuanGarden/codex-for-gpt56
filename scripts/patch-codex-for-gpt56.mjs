@@ -12,6 +12,7 @@ const MODEL_CATALOG_URL = "https://raw.githubusercontent.com/openai/codex/main/c
 const DEFAULT_NAME = "Codex for GPT-5.6";
 const DEFAULT_ROOT = path.join(os.homedir(), "Downloads", "Report", "CodexForGPT56");
 const DEFAULT_BUNDLE_ID = "com.openai.codex.gpt56";
+const SKILL_ID = "codex-for-gpt56";
 
 function usage() {
   console.log(`Usage: patch-codex-for-gpt56.mjs [options]
@@ -280,6 +281,24 @@ async function writeModelCatalog(modelCatalogPath) {
   return parsed;
 }
 
+function codexHomeDir() {
+  return process.env.CODEX_HOME ? expandHome(process.env.CODEX_HOME) : path.join(os.homedir(), ".codex");
+}
+
+function stableModelCatalogPath() {
+  return path.join(codexHomeDir(), "model-catalogs", SKILL_ID, "model-catalog.json");
+}
+
+function backupFileIfExists(file, label) {
+  if (!fs.existsSync(file)) return null;
+  const dir = path.join(codexHomeDir(), "backups");
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "").replace("T", "-");
+  const backup = path.join(dir, `${path.basename(file)}.before-${label}-${stamp}`);
+  fs.copyFileSync(file, backup);
+  return backup;
+}
+
 function upsertTopLevelToml(text, key, value, { onlyIfMissing = false } = {}) {
   const lines = text.split(/\n/);
   const firstSection = lines.findIndex((line) => /^\s*\[/.test(line));
@@ -297,15 +316,16 @@ function upsertTopLevelToml(text, key, value, { onlyIfMissing = false } = {}) {
 }
 
 function updateCodexConfig(modelCatalogPath) {
-  const codexDir = process.env.CODEX_HOME ? expandHome(process.env.CODEX_HOME) : path.join(os.homedir(), ".codex");
+  const codexDir = codexHomeDir();
   const configPath = path.join(codexDir, "config.toml");
   fs.mkdirSync(codexDir, { recursive: true });
   let text = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const backupPath = backupFileIfExists(configPath, "gpt56-catalog");
   text = upsertTopLevelToml(text, "model_catalog_json", JSON.stringify(modelCatalogPath));
   text = upsertTopLevelToml(text, "model_reasoning_effort", JSON.stringify("xhigh"), { onlyIfMissing: true });
   text = upsertTopLevelToml(text, "service_tier", JSON.stringify("priority"), { onlyIfMissing: true });
   fs.writeFileSync(configPath, text.endsWith("\n") ? text : `${text}\n`);
-  return configPath;
+  return { configPath, backupPath };
 }
 
 function writeMacLauncher(root, targetApp, name) {
@@ -717,7 +737,8 @@ async function main() {
   const work = path.join(opts.root, ".patch-work");
   const unpacked = path.join(work, "unpacked");
   const packedAsar = path.join(work, "app.asar");
-  const modelCatalogPath = path.join(opts.root, "model-catalog.json");
+  const modelCatalogPath = stableModelCatalogPath();
+  const modelCatalogReportCopy = path.join(opts.root, "model-catalog.json");
   const reportPath = path.join(opts.root, "repair-report.json");
 
   copyApp(sourceApp, paths.targetApp);
@@ -734,7 +755,9 @@ async function main() {
   fs.copyFileSync(packedAsar, paths.targetAsar);
 
   const modelCatalog = await writeModelCatalog(modelCatalogPath);
-  const configPath = updateCodexConfig(modelCatalogPath);
+  fs.mkdirSync(path.dirname(modelCatalogReportCopy), { recursive: true });
+  fs.copyFileSync(modelCatalogPath, modelCatalogReportCopy);
+  const configUpdate = updateCodexConfig(modelCatalogPath);
   const launcherInfo = writeLauncher(opts.root, paths.targetApp, opts.name);
   const desktopEntry = opts.desktop ? createDesktopEntry(opts.root, paths.targetApp, opts.name) : { status: "skipped" };
   const signing = signAndVerify(paths.targetApp);
@@ -765,7 +788,7 @@ async function main() {
   const report = {
     generatedAt: new Date().toISOString(),
     platform: process.platform,
-    skill: "codex-for-gpt56",
+    skill: SKILL_ID,
     appName: opts.name,
     appSlug: appSlug(opts.name),
     bundleId: process.platform === "darwin" ? DEFAULT_BUNDLE_ID : null,
@@ -774,8 +797,10 @@ async function main() {
     launcher: launcherInfo.launcher,
     desktopEntry,
     appIdentity,
-    configPath,
+    configPath: configUpdate.configPath,
+    configBackupPath: configUpdate.backupPath,
     modelCatalogPath,
+    modelCatalogReportCopy,
     modelCatalogModelCount: modelCatalog.models.length,
     sourceAsarSha256,
     packedAsarSha256,
