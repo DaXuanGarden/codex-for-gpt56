@@ -73,3 +73,8 @@ The generated catalog includes:
 - `gpt-5.6-luna`: `low`, `medium`, `high`, `xhigh`, `max`
 
 `ultra` is a reasoning effort, not a model suffix.
+
+## Social Posts
+
+- [WeChat article draft](docs/social/wechat-post.md)
+- [Xiaohongshu post draft](docs/social/xiaohongshu-post.md)
