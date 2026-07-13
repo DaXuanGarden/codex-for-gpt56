@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  classifyRendererSmokeOutput,
+  isManagedCopyCurrent,
   macManagedUpdatePrelude,
   normalizeModelCatalogForCliBaseline,
   patchJsTree,
@@ -43,6 +45,8 @@ test("semantic patcher survives renamed minifier variables", () => {
     assert.match(patched, /ta=\[`low`,`medium`,`high`,`xhigh`,`max`,`ultra`\]/);
     assert.match(patched, /let l=!0/);
     assert.match(patched, /t\.has\(n\.model\)\|\|\(n\.model===`gpt-5\.6-sol`/);
+    assert.match(patched, /let r=Fs\(Rs,e\)/);
+    assert.doesNotMatch(patched, /let r=Rs\(\d+,e\)/);
     assert.match(patched, /return r\.length>=4\?r:t\?\[\.\.\.Is,Ls\]:Is/);
 
     const rerun = patchJsTree(root);
@@ -132,6 +136,23 @@ test("semantic model repair does not rewrite legacy API-key Fast auth logic", ()
   });
 });
 
+
+test("managed refresh rebuilds when the patch-engine generation changes", () => {
+  const sourceFingerprint = { appAsarSha256: "a".repeat(64), codexSha256: "b".repeat(64), identitySha256: "c".repeat(64) };
+  const targetFingerprint = { appAsarSha256: "d".repeat(64), codexSha256: "e".repeat(64), identitySha256: "f".repeat(64) };
+  const modelCatalogSha256 = "1".repeat(64);
+  const plan = {
+    version: 3,
+    patchEngineVersion: "semantic-v2",
+    sourceFingerprint,
+    targetFingerprint,
+    modelCatalogSha256,
+  };
+
+  assert.equal(isManagedCopyCurrent(plan, sourceFingerprint, targetFingerprint, modelCatalogSha256, "semantic-v2"), true);
+  assert.equal(isManagedCopyCurrent(plan, sourceFingerprint, targetFingerprint, modelCatalogSha256, "semantic-v3"), false);
+});
+
 test("managed macOS launcher prelude fails closed when helper is unavailable", () => {
   const prelude = macManagedUpdatePrelude("/tmp/missing managed helper.command");
   assert.match(prelude, /if \[\[ ! -x "\$MANAGED_UPDATER" \]\]/);
@@ -144,4 +165,28 @@ test("top-level TOML reader handles quotes and ignores section-local keys", () =
   assert.equal(readTopLevelTomlString('model_catalog_json = "/tmp/catalog.json"\n[other]\nmodel_catalog_json = "wrong"\n', "model_catalog_json"), "/tmp/catalog.json");
   assert.equal(readTopLevelTomlString("model_catalog_json = '/tmp/single.json' # keep\n", "model_catalog_json"), "/tmp/single.json");
   assert.equal(readTopLevelTomlString('[other]\nmodel_catalog_json = "/tmp/wrong.json"\n', "model_catalog_json"), null);
+});
+
+
+test("renderer smoke classifier rejects the React error boundary seen in broken copies", () => {
+  const result = classifyRendererSmokeOutput([
+    "DevTools listening on ws://127.0.0.1:60766/devtools/browser/test",
+    "[startup][renderer] app routes mounted after 3029ms",
+    "Electron renderer console [error] app://-/assets/chunk.js:8 TypeError: Rs is not a function",
+    "[electron-message-handler] error boundary componentStack=...",
+  ].join("\n"));
+  assert.equal(result.routesMounted, true);
+  assert.equal(result.devToolsListening, true);
+  assert.equal(result.fatalErrors.length, 2);
+});
+
+test("renderer smoke classifier accepts a mounted renderer with nonfatal warnings", () => {
+  const result = classifyRendererSmokeOutput([
+    "DevTools listening on ws://127.0.0.1:60766/devtools/browser/test",
+    "Electron renderer console [warning] WARN [Statsig] missing userID",
+    "[startup][renderer] app routes mounted after 12422ms",
+  ].join("\n"));
+  assert.equal(result.routesMounted, true);
+  assert.equal(result.devToolsListening, true);
+  assert.deepEqual(result.fatalErrors, []);
 });

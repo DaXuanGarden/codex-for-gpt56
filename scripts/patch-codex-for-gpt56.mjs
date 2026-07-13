@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -14,15 +14,20 @@ const MODEL_CATALOG_URL = "https://raw.githubusercontent.com/openai/codex/main/c
 const DEFAULT_NAME = "Codex for GPT-5.6";
 const DEFAULT_BUNDLE_ID = "com.openai.codex.gpt56";
 const SKILL_ID = "codex-for-gpt56";
-const MANAGED_UPDATE_VERSION = 2;
+const MANAGED_UPDATE_VERSION = 3;
+const FINGERPRINT_MANAGED_UPDATE_VERSION = 2;
 const LEGACY_MANAGED_UPDATE_VERSION = 1;
 const MODERN_ASAR_PACKAGE = "@electron/asar@4.2.0";
 const LEGACY_ASAR_PACKAGE = "@electron/asar@3.4.1";
 const ASAR_PACKAGE = nodeVersionAtLeast(22, 12) ? MODERN_ASAR_PACKAGE : LEGACY_ASAR_PACKAGE;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
+const DOWNLOAD_ATTEMPTS = 3;
 const MAX_CATALOG_BYTES = 32 * 1024 * 1024;
 const MANAGED_LOCK_STALE_MS = 30 * 60 * 1000;
 const MANAGED_LOCK_WAIT_MS = 10 * 60 * 1000;
+const RENDERER_SMOKE_TIMEOUT_MS = 60_000;
+const RENDERER_SMOKE_SETTLE_MS = 2_000;
+const RENDERER_SMOKE_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const REPAIR_SCRIPT_PATH = fileURLToPath(import.meta.url);
 
 
@@ -438,6 +443,14 @@ function sameFingerprint(left, right) {
   return left != null && right != null && isDeepStrictEqual(left, right);
 }
 
+export function isManagedCopyCurrent(plan, sourceFingerprint, targetFingerprint, modelCatalogSha256, patchEngineVersion = PATCH_ENGINE_VERSION) {
+  return plan?.version === MANAGED_UPDATE_VERSION
+    && plan.patchEngineVersion === patchEngineVersion
+    && sameFingerprint(plan.sourceFingerprint, sourceFingerprint)
+    && sameFingerprint(plan.targetFingerprint, targetFingerprint)
+    && modelCatalogSha256 === plan.modelCatalogSha256;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -561,19 +574,49 @@ function download(url, redirectsRemaining = 5) {
   });
 }
 
-async function fetchModelCatalog() {
-  const text = await download(MODEL_CATALOG_URL);
+function parseAndValidateModelCatalog(text, sourceLabel) {
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
-    throw new Error(`Official model catalog is not valid JSON: ${error.message}`);
+    throw new Error(`${sourceLabel} model catalog is not valid JSON: ${error.message}`);
   }
-  if (!Array.isArray(parsed.models)) throw new Error("Official model catalog does not contain models[]");
+  if (!Array.isArray(parsed.models)) throw new Error(`${sourceLabel} model catalog does not contain models[]`);
   for (const slug of REQUIRED_MODELS) {
-    if (!parsed.models.some((model) => model.slug === slug)) throw new Error(`Official model catalog is missing ${slug}`);
+    if (!parsed.models.some((model) => model.slug === slug)) throw new Error(`${sourceLabel} model catalog is missing ${slug}`);
   }
   return parsed;
+}
+
+async function fetchModelCatalog(cachePath = null) {
+  let lastError;
+  const maxAttempts = cachePath != null && fs.existsSync(cachePath) ? 1 : DOWNLOAD_ATTEMPTS;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const text = await download(MODEL_CATALOG_URL);
+      return {
+        catalog: parseAndValidateModelCatalog(text, "Official"),
+        retrieval: { status: "fresh", url: MODEL_CATALOG_URL, attempts: attempt },
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt < maxAttempts) await sleep(500 * attempt);
+    }
+  }
+  if (cachePath != null && fs.existsSync(cachePath)) {
+    const catalog = parseAndValidateModelCatalog(fs.readFileSync(cachePath, "utf8"), "Cached official");
+    return {
+      catalog,
+      retrieval: {
+        status: "cached-fallback",
+        url: MODEL_CATALOG_URL,
+        cachePath,
+        attempts: maxAttempts,
+        networkError: lastError?.message ?? String(lastError),
+      },
+    };
+  }
+  throw lastError;
 }
 
 function writeModelCatalog(modelCatalogPath, modelCatalog) {
@@ -771,7 +814,7 @@ function readManagedUpdatePlan(root) {
   } catch (error) {
     throw new Error(`Managed-update plan is not valid JSON: ${planPath}: ${error.message}`);
   }
-  const commonShapeValid = [LEGACY_MANAGED_UPDATE_VERSION, MANAGED_UPDATE_VERSION].includes(plan?.version)
+  const commonShapeValid = [LEGACY_MANAGED_UPDATE_VERSION, FINGERPRINT_MANAGED_UPDATE_VERSION, MANAGED_UPDATE_VERSION].includes(plan?.version)
     && typeof plan.stateRoot === "string"
     && typeof plan.sourceApp === "string"
     && typeof plan.appParent === "string"
@@ -798,8 +841,9 @@ function readManagedUpdatePlan(root) {
     || typeof plan.bundledRepairScript !== "string"
     || typeof plan.nodePath !== "string"
     || typeof plan.npxPath !== "string"
+    || (plan.version === MANAGED_UPDATE_VERSION && (typeof plan.patchEngineVersion !== "string" || plan.patchEngineVersion.length === 0))
   ) {
-    throw new Error(`Managed-update v${MANAGED_UPDATE_VERSION} plan is incomplete: ${planPath}`);
+    throw new Error(`Managed-update v${plan.version} plan is incomplete: ${planPath}`);
   }
   return plan;
 }
@@ -833,7 +877,7 @@ function assertManagedRefreshPlan(plan, opts, sourceApp, paths, modelCatalogPath
   if (comparablePath(plan.targetApp) !== comparablePath(paths.targetApp)) {
     throw new Error("Managed-update target app does not match the saved plan");
   }
-  if (plan.version === MANAGED_UPDATE_VERSION && comparablePath(plan.modelCatalogPath) !== comparablePath(modelCatalogPath)) {
+  if (plan.version >= FINGERPRINT_MANAGED_UPDATE_VERSION && comparablePath(plan.modelCatalogPath) !== comparablePath(modelCatalogPath)) {
     throw new Error("Managed-update catalog path does not match the approved stable catalog path");
   }
 }
@@ -852,6 +896,7 @@ function writeManagedUpdateFiles(opts, sourceApp, paths, sourceFingerprint, targ
   }
   const plan = {
     version: MANAGED_UPDATE_VERSION,
+    patchEngineVersion: PATCH_ENGINE_VERSION,
     generatedAt: new Date().toISOString(),
     stateRoot: opts.root,
     codexHome: codexHomeDir(),
@@ -1095,7 +1140,7 @@ function walkFiles(dir, predicate, out = []) {
   return out;
 }
 
-const PATCH_ENGINE_VERSION = "semantic-v1";
+const PATCH_ENGINE_VERSION = "semantic-v2";
 const GPT56_MODEL_CONDITION = "($MODEL.model===`gpt-5.6-sol`||$MODEL.model===`gpt-5.6-terra`||$MODEL.model===`gpt-5.6-luna`)";
 
 // These rules deliberately match stable *behavioral* shapes rather than minified
@@ -1225,11 +1270,15 @@ function patchGpt56PowerSelectionFallback(text) {
   // preferred list and a four-item fallback. Restore the preset list only when
   // that exact GPT-5.6 data is present in the same JavaScript chunk.
   const fallback = /function\s+([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=!1\)\{let\s+([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(\3\?\[\.\.\.([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\]:\6,\2\);if\(\4\.length>=4\)return\s+\4;let\s+([A-Za-z_$][\w$]*)=\5\(([A-Za-z_$][\w$]*),\2\);return\s+\8\.length>=4\?\8:\[\]\}/g;
-  outcome.text = text.replace(fallback, (whole, fn, models, includeUltra, preferred, selector, presets, ultraPreset, fallbackItems, fallbackSelector, fallbackSource) => {
+  outcome.text = text.replace(fallback, (whole, fn, models, includeUltra, preferred, selector, presets, ultraPreset, fallbackItems, fallbackSource) => {
     if (!hasGpt56PresetList(text, presets)) return whole;
     outcome.matches += 1;
     outcome.replacements += 1;
-    return `function ${fn}(${models},${includeUltra}=!1){let ${preferred}=${selector}(${includeUltra}?[...${presets},${ultraPreset}]:${presets},${models});if(${preferred}.length>=4)return ${preferred};let ${fallbackItems}=${fallbackSelector}(${fallbackSource},${models});return ${fallbackItems}.length>=4?${fallbackItems}:${includeUltra}?[...${presets},${ultraPreset}]:${presets}}`;
+    // The second selector call is a back-reference to capture 5, not a new
+    // capture group. Keep using `selector` here. An earlier callback signature
+    // had one extra parameter, which shifted `fallbackSource` onto replace()'s
+    // numeric offset and emitted code such as `Rs(78618,e)`.
+    return `function ${fn}(${models},${includeUltra}=!1){let ${preferred}=${selector}(${includeUltra}?[...${presets},${ultraPreset}]:${presets},${models});if(${preferred}.length>=4)return ${preferred};let ${fallbackItems}=${selector}(${fallbackSource},${models});return ${fallbackItems}.length>=4?${fallbackItems}:${includeUltra}?[...${presets},${ultraPreset}]:${presets}}`;
   });
   // This broad enough check recognizes the fallback we inject without relying
   // on its minifier names, but only in chunks that contain GPT-5.6 presets.
@@ -1292,6 +1341,131 @@ function signAndVerify(targetApp) {
   run("codesign", ["--force", "--deep", "--sign", "-", targetApp], { allowFailure: true });
   const verify = run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", targetApp], { allowFailure: true });
   return { skipped: false, ok: verify.status === 0, stderr: verify.stderr.trim() };
+}
+
+export function classifyRendererSmokeOutput(output) {
+  const lines = String(output).split(/\r?\n/);
+  const fatalPatterns = [
+    /\[electron-message-handler\] error boundary\b/i,
+    /Electron renderer console \[error\].*\b(?:TypeError|ReferenceError|SyntaxError)\b/i,
+    /render-process-gone.*reason=(?!clean-exit)/i,
+    /uncaught (?:exception|error)/i,
+  ];
+  const fatalErrors = lines
+    .filter((line) => fatalPatterns.some((pattern) => pattern.test(line)))
+    .map((line) => line.slice(0, 2_000))
+    .slice(0, 10);
+  return {
+    routesMounted: lines.some((line) => line.includes("[startup][renderer] app routes mounted")),
+    devToolsListening: lines.some((line) => line.includes("DevTools listening on ws://")),
+    fatalErrors,
+  };
+}
+
+function appendBoundedOutput(current, chunk) {
+  const next = current + chunk.toString("utf8");
+  return next.length <= RENDERER_SMOKE_MAX_OUTPUT_BYTES
+    ? next
+    : next.slice(next.length - RENDERER_SMOKE_MAX_OUTPUT_BYTES);
+}
+
+async function verifyRendererSmoke(targetApp, root, modelCatalogPath) {
+  if (process.platform !== "darwin") {
+    return { requested: true, status: "skipped", reason: `renderer smoke verification is not implemented for ${process.platform}` };
+  }
+  const plist = path.join(targetApp, "Contents", "Info.plist");
+  const executableName = run("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleExecutable", plist]).stdout.trim();
+  const executable = path.join(targetApp, "Contents", "MacOS", executableName);
+  if (!fs.existsSync(executable)) throw new Error(`Copied app executable is missing: ${executable}`);
+
+  const smokeRoot = path.join(root, ".renderer-smoke");
+  const userData = path.join(smokeRoot, "user-data");
+  const smokeCodexHome = path.join(smokeRoot, "codex-home");
+  fs.rmSync(smokeRoot, { recursive: true, force: true });
+  fs.mkdirSync(userData, { recursive: true });
+  fs.mkdirSync(smokeCodexHome, { recursive: true });
+  fs.writeFileSync(path.join(smokeCodexHome, "config.toml"), `model_catalog_json = ${JSON.stringify(modelCatalogPath)}\n`);
+
+  const startedAt = Date.now();
+  let output = "";
+  let mountedAt = null;
+  let childError = null;
+  const child = spawn(executable, [
+    `--user-data-dir=${userData}`,
+    "--remote-debugging-port=0",
+  ], {
+    env: {
+      ...process.env,
+      CODEX_HOME: smokeCodexHome,
+      ELECTRON_ENABLE_LOGGING: "1",
+      RUST_LOG: process.env.RUST_LOG || "info",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.on("data", (chunk) => { output = appendBoundedOutput(output, chunk); });
+  child.stderr.on("data", (chunk) => { output = appendBoundedOutput(output, chunk); });
+  child.on("error", (error) => { childError = error; });
+
+  let result;
+  try {
+    result = await new Promise((resolve) => {
+      let settled = false;
+      let timer;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(timer);
+        resolve(value);
+      };
+      timer = setInterval(() => {
+        const classified = classifyRendererSmokeOutput(output);
+        if (childError != null) {
+          finish({ status: "failed", ...classified, error: childError.message });
+          return;
+        }
+        if (classified.fatalErrors.length > 0) {
+          finish({ status: "failed", ...classified, error: "renderer reported a fatal JavaScript/error-boundary failure" });
+          return;
+        }
+        if (classified.routesMounted) {
+          mountedAt ??= Date.now();
+          if (Date.now() - mountedAt >= RENDERER_SMOKE_SETTLE_MS) {
+            finish({ status: "passed", ...classified });
+          }
+          return;
+        }
+        if (Date.now() - startedAt >= RENDERER_SMOKE_TIMEOUT_MS) {
+          finish({ status: "failed", ...classified, error: "renderer did not mount app routes before the smoke-test timeout" });
+        }
+      }, 250);
+      timer.unref?.();
+      child.once("exit", (code, signal) => {
+        const classified = classifyRendererSmokeOutput(output);
+        finish({
+          status: "failed",
+          ...classified,
+          exitedEarly: true,
+          exitCode: code,
+          signal,
+          error: `copied app exited before the renderer smoke-test settling period completed (code=${code}, signal=${signal})`,
+        });
+      });
+    });
+  } finally {
+    child.kill("SIGTERM");
+    for (const appPattern of new Set([targetApp, canonicalPath(targetApp)])) {
+      run("pkill", ["-TERM", "-f", "--", appPattern], { allowFailure: true });
+    }
+    child.stdout.destroy();
+    child.stderr.destroy();
+    child.unref();
+    fs.rmSync(smokeRoot, { recursive: true, force: true });
+  }
+  return {
+    requested: true,
+    durationMs: Date.now() - startedAt,
+    ...result,
+  };
 }
 
 function parseDebugModels(codexPath, modelCatalogPath) {
@@ -1526,10 +1700,12 @@ async function main() {
     if (managedRefreshPlan != null) {
       managedConfigPath = assertManagedConfigState(managedRefreshPlan, modelCatalogPath);
       const catalogSha256 = sha256IfExists(modelCatalogPath);
-      const managedCopyIsCurrent = managedRefreshPlan.version === MANAGED_UPDATE_VERSION
-        && sameFingerprint(managedRefreshPlan.sourceFingerprint, sourceFingerprint)
-        && sameFingerprint(managedRefreshPlan.targetFingerprint, currentTargetFingerprint)
-        && catalogSha256 === managedRefreshPlan.modelCatalogSha256;
+      const managedCopyIsCurrent = isManagedCopyCurrent(
+        managedRefreshPlan,
+        sourceFingerprint,
+        currentTargetFingerprint,
+        catalogSha256,
+      );
       if (managedCopyIsCurrent) {
         fs.rmSync(managedUpdateFailurePath(opts.root), { force: true });
         console.log(`Managed copy is current for ${sourceApp}; no rebuild was needed.`);
@@ -1567,7 +1743,8 @@ async function main() {
     run("npx", ["--yes", ASAR_PACKAGE, "pack", unpacked, packedAsar], { stdio: "inherit" });
     const asarList = validateAsarList(packedAsar);
     const packedAsarSha256 = sha256(packedAsar);
-    const upstreamModelCatalog = await fetchModelCatalog();
+    const modelCatalogFetch = await fetchModelCatalog(modelCatalogPath);
+    const upstreamModelCatalog = modelCatalogFetch.catalog;
     const modelCatalogCompatibility = makeCliCompatibleModelCatalog(sourceCodexPath(sourceApp), upstreamModelCatalog);
     const modelCatalog = modelCatalogCompatibility.catalog;
 
@@ -1639,6 +1816,30 @@ async function main() {
       throw error;
     }
 
+    let rendererSmoke;
+    try {
+      rendererSmoke = await verifyRendererSmoke(paths.targetApp, opts.root, modelCatalogValidationPath);
+      if (rendererSmoke.status !== "passed") throw new Error(rendererSmoke.error || rendererSmoke.reason || "renderer smoke verification did not pass");
+    } catch (error) {
+      rendererSmoke ??= { requested: true, status: "failed", error: error.message };
+      writeFailureReport(reportPath, {
+        failureStage: "renderer-smoke",
+        platform: process.platform,
+        stateRoot: opts.root,
+        sourceApp,
+        targetApp: paths.targetApp,
+        sourceAsarSha256,
+        sourceFingerprint,
+        packedAsarSha256,
+        targetAsarSha256,
+        jsPatch,
+        signing,
+        rendererSmoke,
+        globalConfigChanged: false,
+      });
+      throw new Error(`Copied app renderer smoke verification failed: ${error.message}. No global Codex config was changed.`);
+    }
+
     const targetFingerprint = appFingerprint(paths.targetApp, paths.targetAsar, paths.codexPath);
     writeModelCatalog(modelCatalogPath, modelCatalog);
     const modelCatalogSha256 = sha256(modelCatalogPath);
@@ -1686,6 +1887,7 @@ async function main() {
     if (signing.skipped && process.platform === "darwin") warnings.push("macOS signing verification was skipped");
     if (wireVerification.status === "failed") warnings.push("Optional wire verification failed");
     if (launch.status === "failed") warnings.push("Requested app launch failed");
+    if (modelCatalogFetch.retrieval.status === "cached-fallback") warnings.push("Used the last validated cached official model catalog because the upstream catalog was temporarily unreachable");
 
     const report = {
       generatedAt: new Date().toISOString(),
@@ -1710,6 +1912,7 @@ async function main() {
       modelCatalogPath,
       modelCatalogReportCopy,
       modelCatalogSource: MODEL_CATALOG_URL,
+      modelCatalogRetrieval: modelCatalogFetch.retrieval,
       modelCatalogModelCount: modelCatalog.models.length,
       modelCatalogCompatibility: modelCatalogCompatibility.verification,
       managedUpdates,
@@ -1722,6 +1925,7 @@ async function main() {
       jsChecked,
       asarList,
       signing,
+      rendererSmoke,
       debugModels,
       pluginMarketplace,
       wireVerification,
