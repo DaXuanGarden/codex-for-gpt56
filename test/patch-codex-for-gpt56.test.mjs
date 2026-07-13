@@ -9,7 +9,9 @@ import {
   macManagedUpdatePrelude,
   normalizeModelCatalogForCliBaseline,
   patchJsTree,
+  removeManagedUpdateFiles,
   readTopLevelTomlString,
+  reconcileManagedCatalogConfigText,
 } from "../scripts/patch-codex-for-gpt56.mjs";
 
 function withJsTree(source, callback) {
@@ -142,7 +144,7 @@ test("managed refresh rebuilds when the patch-engine generation changes", () => 
   const targetFingerprint = { appAsarSha256: "d".repeat(64), codexSha256: "e".repeat(64), identitySha256: "f".repeat(64) };
   const modelCatalogSha256 = "1".repeat(64);
   const plan = {
-    version: 3,
+    version: 4,
     patchEngineVersion: "semantic-v2",
     sourceFingerprint,
     targetFingerprint,
@@ -167,6 +169,47 @@ test("top-level TOML reader handles quotes and ignores section-local keys", () =
   assert.equal(readTopLevelTomlString('[other]\nmodel_catalog_json = "/tmp/wrong.json"\n', "model_catalog_json"), null);
 });
 
+test("managed config reconciliation restores only model_catalog_json", () => {
+  const before = [
+    'model_provider = "custom"',
+    'model = "gpt-5.6-terra"',
+    'model_reasoning_effort = "medium"',
+    'model_catalog_json = "cc-switch-model-catalog.json"',
+    '',
+    '[model_providers.custom]',
+    'base_url = "http://127.0.0.1:15721/v1"',
+    '',
+  ].join("\n");
+  const catalog = "/Users/example/.codex/model-catalogs/codex-for-gpt56/model-catalog.json";
+  const after = reconcileManagedCatalogConfigText(before, catalog);
+
+  assert.equal(readTopLevelTomlString(after, "model_catalog_json"), catalog);
+  assert.match(after, /model_provider = "custom"/);
+  assert.match(after, /model = "gpt-5\.6-terra"/);
+  assert.match(after, /model_reasoning_effort = "medium"/);
+  assert.match(after, /base_url = "http:\/\/127\.0\.0\.1:15721\/v1"/);
+  assert.equal((after.match(/model_catalog_json/g) || []).length, 1);
+});
+
+test("explicit managed opt-out removes only managed metadata", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gpt56-managed-opt-out-"));
+  const helper = process.platform === "win32" ? "refresh-managed-copy.cmd" : "refresh-managed-copy.command";
+  const managedFiles = ["managed-update.json", helper, "managed-repair.mjs", "managed-update-failure.json"];
+  const unrelated = path.join(root, "keep.txt");
+  try {
+    for (const name of managedFiles) fs.writeFileSync(path.join(root, name), name);
+    fs.writeFileSync(unrelated, "keep");
+
+    const result = removeManagedUpdateFiles(root);
+
+    assert.equal(result.status, "disabled-explicitly");
+    assert.equal(result.removed.length, managedFiles.length);
+    for (const name of managedFiles) assert.equal(fs.existsSync(path.join(root, name)), false);
+    assert.equal(fs.readFileSync(unrelated, "utf8"), "keep");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("renderer smoke classifier rejects the React error boundary seen in broken copies", () => {
   const result = classifyRendererSmokeOutput([
