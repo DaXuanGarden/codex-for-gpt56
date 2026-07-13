@@ -9,25 +9,26 @@ The repository contains source code for the skill only. It does not contain a mo
 ## Scope And Requirements
 
 - Repair targets are macOS and Windows only. Linux can store the skill, but cannot run this repair.
-- Install a current Node.js distribution with both `node` and `npx` on `PATH`.
+- Install a current Node.js distribution with both `node` and `npx` on `PATH` for the initial repair. Managed launchers persist the resolved Node/npx locations and restore their directories when Finder/Explorer supplies a minimal `PATH`.
 - Keep a local Codex or ChatGPT Electron app whose bundle contains `app.asar`. Close the copied app before rebuilding it.
-- Allow network access while running: the script fetches the current upstream model catalog and `npx` fetches `@electron/asar` when needed.
+- Allow network access while running: the script fetches the current upstream model catalog with timeout/redirect/size limits. `npx` uses pinned `@electron/asar@4.2.0` on Node 22.12+ and pinned `@electron/asar@3.4.1` on older Node runtimes.
 - Leave enough disk space for a second app copy and a temporary unpacked `app.asar` tree.
-- Expect app-build sensitivity. The WebView changes use exact code signatures; a desktop update can make a patch point unavailable.
+- The patch engine is build-agnostic: it locates bounded semantic shapes (reasoning-effort arrays, the Ultra gate, hidden-model filtering, and GPT-5.6 presets) instead of build numbers or minified variable names. It still fails closed when a future app no longer contains a validated shape; this prevents an unknown desktop build from receiving a broad or guessed rewrite.
 
 `CODEX_HOME` controls the Codex configuration root. When it is unset, the paths below use `~/.codex` on macOS and the equivalent user-home path on Windows.
 
 ## What Changes
 
-The script intentionally makes these local changes after a successful patch analysis:
+The analysis is not tied to an application version: it reports the semantic capabilities it found, how many locations it changed, and any required capability that was absent. A missing required capability stops the workflow before an app copy or global configuration is changed. After that analysis succeeds, the script intentionally makes these local changes:
 
 - Creates a copied app beside the source app when writable, otherwise in a user-owned Applications/Programs folder.
 - Creates an isolated user-data directory and a root launcher. It also creates a Desktop launcher unless `--no-desktop` is used.
-- Downloads the full current upstream model catalog to `$CODEX_HOME/model-catalogs/codex-for-gpt56/model-catalog.json` and stores a report copy under the state root.
+- Downloads the current upstream model catalog, fills only fields absent from it with the installed app CLI's own serialized baseline when schemas have drifted, verifies that normalized catalog against that exact CLI, then stores it at `$CODEX_HOME/model-catalogs/codex-for-gpt56/model-catalog.json` and as a report copy under the state root.
 - Backs up `$CODEX_HOME/config.toml`, then sets its top-level `model_catalog_json` to that persistent catalog path. If missing, it also adds `model_reasoning_effort = "xhigh"` and `service_tier = "priority"`.
 - Writes a JSON report under the state root. The default is `$CODEX_HOME/codex-for-gpt56/repair-report.json`.
+- When explicitly enabled with `--managed-updates`, writes full original/copy fingerprints (`app.asar`, embedded Codex CLI, and app identity), a persistent-catalog checksum, a bundled repair-script fallback, and a refresh helper. The generated root/Desktop launchers run that helper before opening the copied app: if the official source, copied bundle, or managed catalog has changed, they rebuild, patch, re-sign, and validate a fresh copy before launch.
 
-The launcher profile is isolated, but the `config.toml` changes are global to the active `CODEX_HOME`. Review the dry-run plan before approving a repair.
+The catalog bridge is schema-adaptive, not a version allowlist: the current upstream model values remain authoritative. A matching model can inherit its own missing CLI-baseline fields; an unmatched model receives only fields that are uniform across the baseline, preventing model-specific values from being copied from an unrelated entry. The normalized result must parse successfully before it is persisted. This skill changes only GPT-5.6 model-picker behavior; it does not rewrite API-key, Fast-mode, account-entitlement, or service-authorization logic. Managed updates deliberately use the original app as the update channel rather than relying on the patched copy's own updater, which could overwrite `app.asar` before it can be revalidated. The launcher profile is isolated, but the initial `config.toml` changes are global to the active `CODEX_HOME`. Review the dry-run plan before approving a repair.
 
 ## Install As A Codex Skill
 
@@ -92,12 +93,25 @@ With default options, the generated app is placed here:
 - Persistent model catalog: `$CODEX_HOME/model-catalogs/codex-for-gpt56/model-catalog.json`
 - State, launcher, isolated user data, and report: `$CODEX_HOME/codex-for-gpt56`
 
-The script refuses to overwrite an existing generated app or launcher by default. Re-run the dry run after an app update, then use `--replace` only after confirming every planned output path is safe to replace:
+The script refuses to overwrite an existing generated app or launcher by default. Without managed updates, re-run the dry run after an app update, then use `--replace` only after confirming every planned output path is safe to replace:
 
 ```bash
 ./scripts/patch-codex-for-gpt56.sh --dry-run
 ./scripts/patch-codex-for-gpt56.sh --replace --launch
 ```
+
+### Managed Updates (Opt-In)
+
+Use `--managed-updates` during an approved repair when the copied app should stay synchronized with future official updates:
+
+```bash
+./scripts/patch-codex-for-gpt56.sh --dry-run --managed-updates
+./scripts/patch-codex-for-gpt56.sh --managed-updates --launch
+```
+
+This does **not** modify the original app or install a background daemon. Before every generated-launcher start, the helper validates SHA-256 fingerprints for the original and copied `app.asar`, embedded Codex CLI, and app identity, plus the persistent model-catalog checksum. Refreshes are serialized with a state-root lock. When a critical input has changed, the helper rebuilds from the official source, applies the semantic patch, re-signs it on macOS, validates the normalized catalog and copied CLI, then opens it. Missing helpers, missing Node, catalog drift, config-path drift, failed patching, failed signing, or failed model validation stop the launch instead of silently opening an unchecked copy. A managed refresh never rewrites a later user change to `config.toml`; re-run an explicitly approved repair to adopt a different catalog configuration.
+
+The helper prefers the current repair script at the path used for the approved repair and keeps a bundled snapshot under the state root as a fallback if that checkout is moved. To teach an existing managed installation about future semantic UI shapes, update the skill checkout (for example, `git pull` in the skill directory); the next launcher refresh uses that updated script when the path still exists. This avoids a desktop-build allowlist, but it is intentionally not an unrestricted blind patch: a genuinely new UI architecture still fails closed until the semantic matcher and tests are updated. Launch the copied app through its generated launcher; opening the copied `.app`/`.exe` directly bypasses this pre-launch refresh.
 
 `--root <path>` changes more than report storage: unless `--app-parent` is also supplied, the copied app is written to `<path>/app`. Use `--app-parent` to keep the app copy outside a custom state root.
 
@@ -114,6 +128,7 @@ The script refuses to overwrite an existing generated app or launcher by default
 | `--no-desktop` | Does not create a Desktop launcher. The root launcher is still created. |
 | `--launch` | Starts the copied app with its isolated user-data directory after the repair. |
 | `--verify-wire` | Runs a copied-CLI request against a local mock Responses endpoint. It does not test a live account, server access, or the desktop picker. |
+| `--managed-updates` | Opts into launcher-managed refreshes. Before each launcher start, validate source/copy app fingerprints, catalog checksum, and approved config path; rebuild/revalidate when needed and fail closed on drift or incompatibility. |
 | `--with-plugin-marketplace` | Validates a local `plugin-account.json` and optional auth-file path only. It does not upload, sync, or change plugin marketplace state. |
 | `--plugin-account <path>` | Selects the file used by the optional plugin-account validation. `sk-` API-key values are rejected. |
 

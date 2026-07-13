@@ -13,7 +13,7 @@ Treat the directory containing this `SKILL.md` as `SKILL_DIR`. Invoke bundled en
 
 1. Confirm that the user wants a local client-side repair, not an explanation of model availability.
 2. Confirm macOS or Windows. Stop on Linux because the repair script does not support it.
-3. Confirm an installed Codex or ChatGPT Electron app with `app.asar`, `node` and `npx` on `PATH`, network access for the upstream catalog and `@electron/asar`, and enough disk space for an app copy plus temporary unpacked files.
+3. Confirm an installed Codex or ChatGPT Electron app with `app.asar`, `node` and `npx` on `PATH`, network access for the upstream catalog and a pinned `@electron/asar` version (`4.2.0` on Node 22.12+, `3.4.1` on older runtimes), and enough disk space for an app copy plus temporary unpacked files.
 4. Explain that the repair creates a separate app and launcher, changes the active `$CODEX_HOME/config.toml`, and can add a default `xhigh` reasoning effort and `priority` service tier when those keys are absent.
 5. Explain that local visibility does not grant server authorization, account entitlement, billing privileges, or product access. Keep the copied app's client-side behavior clearly separate from service-side access control.
 6. Ask the user to close any previously generated copy before rebuilding it.
@@ -37,7 +37,8 @@ Add `--source-app <path>` if auto-discovery does not select the intended origina
 - the original source app and separate target app;
 - the state root, persistent model catalog, and global `config.toml` path;
 - any existing output paths and whether `--replace` is required;
-- the current upstream catalog URL and transient `npx` dependency.
+- the current upstream catalog URL and the runtime-selected pinned transient ASAR dependency (`npx --yes @electron/asar@4.2.0` on Node 22.12+, otherwise `@electron/asar@3.4.1`);
+- when `--managed-updates` is requested, the managed-update plan/helper paths and the fact that future launcher starts can rebuild the copied app after the official source or copied bundle changes.
 
 Do not run the mutating command until the user explicitly approves those paths and global-config changes. If an existing output is not unquestionably the previous generated output, stop instead of using `--replace`.
 
@@ -57,7 +58,7 @@ On Windows PowerShell:
 & "$SKILL_DIR\scripts\patch-codex-for-gpt56.ps1" --launch
 ```
 
-Add `--replace` only after the user explicitly approves replacement of every existing target and launcher. Use `--no-desktop` when the user does not want a Desktop launcher. Use `--verify-wire` only to test the copied CLI against a local mock Responses endpoint; it is not a live-access or UI test.
+Add `--replace` only after the user explicitly approves replacement of every existing target and launcher. Use `--no-desktop` when the user does not want a Desktop launcher. Use `--verify-wire` only to test the copied CLI against a local mock Responses endpoint; it is not a live-access or UI test. Use `--managed-updates` only when the user explicitly approves future launcher-triggered rebuilds: it never writes the original app and does not install a background agent. Generated launchers validate source/copy fingerprints (`app.asar`, embedded Codex CLI, and app identity), the persistent catalog checksum, and the approved config path before opening. They serialize refreshes with a lock and rebuild from the official original when needed. The helper prefers the current Skill script and falls back to a bundled snapshot; updating the Skill checkout therefore supplies future semantic-matcher improvements when that path still exists.
 
 Treat `--with-plugin-marketplace` as local credential-file validation only. It must not be described as a plugin upload or marketplace sync, and it must reject values that contain `sk-` API keys.
 
@@ -67,19 +68,20 @@ Read the `repair-report.json` path printed by the script. Report success only wh
 
 - `status` is `success`, with no warnings needing resolution.
 - `jsPatch.missing` is empty.
-- Each `debugModels` entry is present and has the expected reasoning efforts.
+- `modelCatalogCompatibility.status` is `passed`; each `debugModels` entry is present and has the reasoning efforts, context window, and service tiers from the normalized current upstream catalog.
 - macOS signing has `signing.ok: true`; Windows signing is expected to be skipped.
 - A requested wire check has `wireVerification.status: "passed"`.
-- `configPath` points to `$CODEX_HOME/config.toml` and `modelCatalogPath` points to `$CODEX_HOME/model-catalogs/codex-for-gpt56/model-catalog.json`.
+- `configPath` points to `$CODEX_HOME/config.toml` and `modelCatalogPath` points to `$CODEX_HOME/model-catalogs/codex-for-gpt56/model-catalog.json`. On managed refresh, `configChanged` must be `false`.
 
-Open the generated Desktop launcher or root `.command`/`.cmd` launcher so the copied app receives its isolated user-data directory. State that a separate sign-in can be required and that the user must manually confirm the picker and service access.
+Open the generated Desktop launcher or root `.command`/`.cmd` launcher so the copied app receives its isolated user-data directory. When managed updates are enabled, these launchers also run the fingerprint refresh before opening the copy; opening the copied app directly bypasses that safety step. State that a separate sign-in can be required and that the user must manually confirm the picker and service access.
 
 ## Handle Failures Safely
 
-- Treat a non-empty `jsPatch.missing` array as an incompatible app build. The script writes `repair-failure-report.json` and stops before creating a copied app or changing global config, while preserving any successful `repair-report.json`. Do not claim a repair; inspect the source build or update the skill's patch signatures.
-- Treat signing or model-validation failures as failed repairs. The copied app can exist, but global config has not changed at that point.
+- Treat a non-empty `jsPatch.missing` array as an incompatible semantic UI shape. The patch engine does not use an app-version allowlist or fixed minifier names; it finds bounded model-picker behaviors and records `jsPatch.capabilities` in the report. If a future build no longer has a validated behavior shape, it writes `repair-failure-report.json` and stops before creating a copied app or changing global config. Do not guess a replacement or claim a repair.
+- Treat signing, catalog-compatibility, or model-validation failures as failed repairs. The copied app can exist, but global config has not changed at that point. For managed updates, a missing helper/Node runtime, fingerprint or catalog drift that cannot be repaired, config-path drift, or any failed validation must stop the launcher rather than starting an unvalidated copied app. Inspect `managed-update-failure.json` and the detailed repair failure report. Managed refresh must never overwrite a later user change to `config.toml`; require a fresh approved repair instead.
 - Treat Desktop-launcher or optional wire-check warnings as incomplete verification, not full success.
 - Never point global `model_catalog_json` to an app copy, report path, Desktop folder, temporary path, or isolated user-data directory.
+- Do not modify API-key/Fast-mode eligibility or other account-entitlement logic; this Skill is limited to local GPT-5.6 model-picker/catalog compatibility.
 - Never log or package credentials, auth JSON contents, API keys, generated apps, `.patch-work`, or `user-data`.
 
 ## Remove A Repair
