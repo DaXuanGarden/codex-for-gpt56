@@ -14,12 +14,15 @@ const MODEL_CATALOG_URL = "https://raw.githubusercontent.com/openai/codex/main/c
 const DEFAULT_NAME = "Codex for GPT-5.6";
 const DEFAULT_BUNDLE_ID = "com.openai.codex.gpt56";
 const SKILL_ID = "codex-for-gpt56";
-const MANAGED_UPDATE_VERSION = 4;
+const MANAGED_UPDATE_VERSION = 5;
+const ISOLATED_CONFIG_MANAGED_UPDATE_VERSION = 5;
+const CONFIG_POLICY_MANAGED_UPDATE_VERSION = 4;
 const PATCH_ENGINE_MANAGED_UPDATE_VERSION = 3;
 const FINGERPRINT_MANAGED_UPDATE_VERSION = 2;
 const LEGACY_MANAGED_UPDATE_VERSION = 1;
 const MANAGED_CONFIG_FAIL_CLOSED = "fail-closed";
 const MANAGED_CONFIG_REPAIR_CATALOG = "repair-catalog";
+const MANAGED_CONFIG_ISOLATED_CATALOG = "isolated-catalog";
 const MODERN_ASAR_PACKAGE = "@electron/asar@4.2.0";
 const LEGACY_ASAR_PACKAGE = "@electron/asar@3.4.1";
 const ASAR_PACKAGE = nodeVersionAtLeast(22, 12) ? MODERN_ASAR_PACKAGE : LEGACY_ASAR_PACKAGE;
@@ -53,7 +56,7 @@ Options:
   --no-desktop                   Do not create a Desktop launcher/link
   --verify-wire                  Optional mock /v1/responses request capture
   --managed-updates              Validate and refresh the copied app before each launcher start
-  --managed-config-repair        Restore only model_catalog_json if another tool changes it
+  --managed-config-repair        Isolate the copied app config when another tool owns config.toml
   --disable-managed-updates      Explicitly replace an existing managed launcher with a plain one
   --refresh-managed-copy         Internal launcher command used by managed launchers
   --with-plugin-marketplace      Validate plugin-account.json only; no plugin sync is performed
@@ -76,6 +79,7 @@ function parseArgs(argv) {
     verifyWire: false,
     managedUpdates: false,
     managedConfigRepair: false,
+    managedIsolatedConfig: false,
     disableManagedUpdates: false,
     refreshManagedCopy: false,
     withPluginMarketplace: false,
@@ -102,7 +106,11 @@ function parseArgs(argv) {
     else if (arg === "--no-desktop") opts.desktop = false;
     else if (arg === "--verify-wire") opts.verifyWire = true;
     else if (arg === "--managed-updates") opts.managedUpdates = true;
-    else if (arg === "--managed-config-repair") { opts.managedUpdates = true; opts.managedConfigRepair = true; }
+    else if (arg === "--managed-config-repair") {
+      opts.managedUpdates = true;
+      opts.managedConfigRepair = true;
+      opts.managedIsolatedConfig = true;
+    }
     else if (arg === "--disable-managed-updates") opts.disableManagedUpdates = true;
     else if (arg === "--refresh-managed-copy") opts.refreshManagedCopy = true;
     else if (arg === "--with-plugin-marketplace") opts.withPluginMarketplace = true;
@@ -435,11 +443,15 @@ function managedUpdateFailurePath(root) {
   return path.join(root, "managed-update-failure.json");
 }
 
+function managedCodexHomePath(root) {
+  return path.join(root, "codex-home");
+}
+
 export function removeManagedUpdateFiles(root) {
   const removed = [];
-  for (const file of [managedUpdatePlanPath(root), managedUpdateHelperPath(root), managedRepairScriptPath(root), managedUpdateFailurePath(root)]) {
+  for (const file of [managedUpdatePlanPath(root), managedUpdateHelperPath(root), managedRepairScriptPath(root), managedUpdateFailurePath(root), managedCodexHomePath(root)]) {
     if (!fs.existsSync(file)) continue;
-    fs.rmSync(file, { force: true });
+    fs.rmSync(file, { recursive: true, force: true });
     removed.push(file);
   }
   return { enabled: false, status: "disabled-explicitly", removed };
@@ -795,12 +807,74 @@ export function reconcileManagedCatalogConfigText(text, modelCatalogPath) {
   return upsertTopLevelToml(text, "model_catalog_json", JSON.stringify(modelCatalogPath));
 }
 
+function syncIsolatedCodexHomeLinks(sourceHome, isolatedHome, stateRoot) {
+  const linked = [];
+  const copied = [];
+  fs.mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  for (const entry of fs.readdirSync(sourceHome, { withFileTypes: true })) {
+    if (entry.name === "config.toml") continue;
+    const source = path.join(sourceHome, entry.name);
+    if (comparablePath(source) === comparablePath(stateRoot)) continue;
+    const target = path.join(isolatedHome, entry.name);
+    if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false }) != null) {
+      const stat = fs.lstatSync(target);
+      if (stat.isSymbolicLink()) {
+        if (comparablePath(path.resolve(isolatedHome, fs.readlinkSync(target))) === comparablePath(source)) continue;
+        fs.rmSync(target, { force: true });
+      } else {
+        if (stat.isFile() && entry.isFile()) {
+          fs.copyFileSync(source, target);
+          copied.push(target);
+        }
+        continue;
+      }
+    }
+    try {
+      fs.symlinkSync(source, target, process.platform === "win32" && entry.isDirectory() ? "junction" : undefined);
+      linked.push(target);
+    } catch (error) {
+      if (!entry.isFile()) throw error;
+      fs.copyFileSync(source, target);
+      copied.push(target);
+    }
+  }
+  return { linked, copied };
+}
+
+export function syncIsolatedCodexConfig(plan, modelCatalogPath, { deferRepair = false } = {}) {
+  const sourceHome = plan.codexHome;
+  const sourceConfigPath = plan.sourceConfigPath ?? path.join(sourceHome, "config.toml");
+  const isolatedHome = plan.launchCodexHome ?? path.dirname(plan.configPath);
+  const configPath = plan.configPath ?? path.join(isolatedHome, "config.toml");
+  const activeConfigPath = path.join(codexHomeDir(), "config.toml");
+  if (comparablePath(sourceConfigPath) !== comparablePath(activeConfigPath)) {
+    throw new Error(`Managed-update source config path does not match the active CODEX_HOME: ${sourceConfigPath}`);
+  }
+  if (!fs.existsSync(sourceConfigPath)) {
+    throw new Error(`Source Codex config is missing: ${sourceConfigPath}. Refusing to launch an isolated copy without the current provider configuration.`);
+  }
+  const sourceText = fs.readFileSync(sourceConfigPath, "utf8");
+  const previousCatalogPath = readTopLevelTomlString(sourceText, "model_catalog_json");
+  if (deferRepair || !fs.existsSync(modelCatalogPath)) {
+    return { configPath, sourceConfigPath, backupPath: null, changed: false, pending: true, policy: MANAGED_CONFIG_ISOLATED_CATALOG, previousCatalogPath, launchCodexHome: isolatedHome };
+  }
+  const updated = reconcileManagedCatalogConfigText(sourceText, modelCatalogPath);
+  const normalized = updated.endsWith("\n") ? updated : `${updated}\n`;
+  const changed = !fs.existsSync(configPath) || fs.readFileSync(configPath, "utf8") !== normalized;
+  const homeSync = syncIsolatedCodexHomeLinks(sourceHome, isolatedHome, plan.stateRoot);
+  if (changed) fs.writeFileSync(configPath, normalized, { mode: 0o600 });
+  return { configPath, sourceConfigPath, backupPath: null, changed, policy: MANAGED_CONFIG_ISOLATED_CATALOG, previousCatalogPath, launchCodexHome: isolatedHome, homeSync };
+}
+
 function ensureManagedConfigState(plan, modelCatalogPath, { deferRepair = false } = {}) {
+  const policy = plan.configPolicy ?? MANAGED_CONFIG_FAIL_CLOSED;
+  if (policy === MANAGED_CONFIG_ISOLATED_CATALOG) {
+    return syncIsolatedCodexConfig(plan, modelCatalogPath, { deferRepair });
+  }
   const configPath = path.join(codexHomeDir(), "config.toml");
   if (plan.configPath && comparablePath(plan.configPath) !== comparablePath(configPath)) {
     throw new Error(`Managed-update plan config path does not match the active CODEX_HOME: ${plan.configPath}`);
   }
-  const policy = plan.configPolicy ?? MANAGED_CONFIG_FAIL_CLOSED;
   if (!fs.existsSync(configPath)) {
     if (policy !== MANAGED_CONFIG_REPAIR_CATALOG) {
       throw new Error(`Managed Codex config is missing: ${configPath}. Re-run an approved repair.`);
@@ -859,7 +933,7 @@ function readManagedUpdatePlan(root) {
   } catch (error) {
     throw new Error(`Managed-update plan is not valid JSON: ${planPath}: ${error.message}`);
   }
-  const commonShapeValid = [LEGACY_MANAGED_UPDATE_VERSION, FINGERPRINT_MANAGED_UPDATE_VERSION, PATCH_ENGINE_MANAGED_UPDATE_VERSION, MANAGED_UPDATE_VERSION].includes(plan?.version)
+  const commonShapeValid = [LEGACY_MANAGED_UPDATE_VERSION, FINGERPRINT_MANAGED_UPDATE_VERSION, PATCH_ENGINE_MANAGED_UPDATE_VERSION, CONFIG_POLICY_MANAGED_UPDATE_VERSION, MANAGED_UPDATE_VERSION].includes(plan?.version)
     && typeof plan.stateRoot === "string"
     && typeof plan.sourceApp === "string"
     && typeof plan.appParent === "string"
@@ -887,7 +961,9 @@ function readManagedUpdatePlan(root) {
     || typeof plan.nodePath !== "string"
     || typeof plan.npxPath !== "string"
     || (plan.version >= PATCH_ENGINE_MANAGED_UPDATE_VERSION && (typeof plan.patchEngineVersion !== "string" || plan.patchEngineVersion.length === 0))
-    || (plan.version === MANAGED_UPDATE_VERSION && ![MANAGED_CONFIG_FAIL_CLOSED, MANAGED_CONFIG_REPAIR_CATALOG].includes(plan.configPolicy))
+    || (plan.version >= CONFIG_POLICY_MANAGED_UPDATE_VERSION && ![MANAGED_CONFIG_FAIL_CLOSED, MANAGED_CONFIG_REPAIR_CATALOG, MANAGED_CONFIG_ISOLATED_CATALOG].includes(plan.configPolicy))
+    || (plan.version >= ISOLATED_CONFIG_MANAGED_UPDATE_VERSION && plan.configPolicy === MANAGED_CONFIG_ISOLATED_CATALOG
+      && (typeof plan.sourceConfigPath !== "string" || typeof plan.launchCodexHome !== "string"))
   ) {
     throw new Error(`Managed-update v${plan.version} plan is incomplete: ${planPath}`);
   }
@@ -907,7 +983,8 @@ function configureManagedRefresh(opts) {
   opts.desktop = Boolean(plan.desktop);
   opts.replace = true;
   opts.managedUpdates = true;
-  opts.managedConfigRepair = plan.configPolicy === MANAGED_CONFIG_REPAIR_CATALOG;
+  opts.managedConfigRepair = [MANAGED_CONFIG_REPAIR_CATALOG, MANAGED_CONFIG_ISOLATED_CATALOG].includes(plan.configPolicy);
+  opts.managedIsolatedConfig = opts.managedConfigRepair;
   return plan;
 }
 
@@ -934,6 +1011,8 @@ function writeManagedUpdateFiles(opts, sourceApp, paths, sourceFingerprint, targ
   const helperPath = managedUpdateHelperPath(opts.root);
   const bundledRepairScript = managedRepairScriptPath(opts.root);
   const npxPath = commandPath("npx");
+  const sourceConfigPath = path.join(codexHomeDir(), "config.toml");
+  const launchCodexHome = opts.managedIsolatedConfig ? managedCodexHomePath(opts.root) : codexHomeDir();
   if (npxPath == null) throw new Error("Could not resolve an absolute npx path for managed updates");
   if (comparablePath(REPAIR_SCRIPT_PATH) !== comparablePath(bundledRepairScript)) {
     removeExistingOutput(bundledRepairScript, opts);
@@ -944,11 +1023,13 @@ function writeManagedUpdateFiles(opts, sourceApp, paths, sourceFingerprint, targ
   const plan = {
     version: MANAGED_UPDATE_VERSION,
     patchEngineVersion: PATCH_ENGINE_VERSION,
-    configPolicy: opts.managedConfigRepair ? MANAGED_CONFIG_REPAIR_CATALOG : MANAGED_CONFIG_FAIL_CLOSED,
+    configPolicy: opts.managedIsolatedConfig ? MANAGED_CONFIG_ISOLATED_CATALOG : MANAGED_CONFIG_FAIL_CLOSED,
     generatedAt: new Date().toISOString(),
     stateRoot: opts.root,
     codexHome: codexHomeDir(),
-    configPath: path.join(codexHomeDir(), "config.toml"),
+    sourceConfigPath,
+    launchCodexHome,
+    configPath: path.join(launchCodexHome, "config.toml"),
     modelCatalogPath,
     modelCatalogSha256,
     sourceApp,
@@ -1008,6 +1089,9 @@ exec "$NODE_BIN" "$REPAIR_SCRIPT" --refresh-managed-copy --root ${shSingle(opts.
     targetFingerprint,
     modelCatalogSha256,
     configPolicy: plan.configPolicy,
+    sourceConfigPath: plan.sourceConfigPath,
+    configPath: plan.configPath,
+    launchCodexHome: plan.launchCodexHome,
   };
 }
 
@@ -1026,14 +1110,15 @@ fi
 `;
 }
 
-function writeMacLauncher(root, targetApp, name, options, managedUpdateHelper = null) {
+function writeMacLauncher(root, targetApp, name, options, managedUpdateHelper = null, launchCodexHome = null) {
   const launcher = path.join(root, `${name}.command`);
   const userData = path.join(root, "user-data");
+  const codexHomeArg = launchCodexHome == null ? "" : `--env ${shSingle(`CODEX_HOME=${launchCodexHome}`)} `;
   const content = `#!/usr/bin/env bash
 set -euo pipefail
 ${macManagedUpdatePrelude(managedUpdateHelper)}USER_DATA=${shSingle(userData)}
 mkdir -p "$USER_DATA"
-open -n ${shSingle(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
+open -n ${codexHomeArg}${shSingle(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
 `;
   removeExistingOutput(launcher, options);
   fs.writeFileSync(launcher, content, { mode: 0o755 });
@@ -1048,13 +1133,14 @@ function cmdEscape(value) {
     .replace(/[&|<>()]/g, "^$&");
 }
 
-function writeWindowsLauncher(root, targetApp, name, options, managedUpdateHelper = null) {
+function writeWindowsLauncher(root, targetApp, name, options, managedUpdateHelper = null, launchCodexHome = null) {
   const exe = findWindowsAppExe(targetApp);
   if (exe == null) throw new Error(`Could not find copied Windows app exe in ${targetApp}`);
   const launcher = path.join(root, `${name}.cmd`);
   const userData = path.join(root, "user-data");
   const update = managedUpdateHelper == null ? "" : `call "${cmdEscape(managedUpdateHelper)}"\r\nif errorlevel 1 exit /b %ERRORLEVEL%\r\n`;
-  const content = `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${update}set "USER_DATA=${cmdEscape(userData)}"\r\nif not exist "%USER_DATA%" mkdir "%USER_DATA%"\r\nstart "" "${cmdEscape(exe)}" --user-data-dir="%USER_DATA%" %*\r\n`;
+  const codexHome = launchCodexHome == null ? "" : `set "CODEX_HOME=${cmdEscape(launchCodexHome)}"\r\n`;
+  const content = `@echo off\r\nsetlocal DisableDelayedExpansion\r\n${update}${codexHome}set "USER_DATA=${cmdEscape(userData)}"\r\nif not exist "%USER_DATA%" mkdir "%USER_DATA%"\r\nstart "" "${cmdEscape(exe)}" --user-data-dir="%USER_DATA%" %*\r\n`;
   removeExistingOutput(launcher, options);
   fs.writeFileSync(launcher, content);
   return { launcher, exe, userData };
@@ -1079,7 +1165,7 @@ ${body}
 `;
 }
 
-function createMacLauncherApp(root, targetApp, name, options, managedUpdateHelper = null) {
+function createMacLauncherApp(root, targetApp, name, options, managedUpdateHelper = null, launchCodexHome = null) {
   const desktop = path.join(os.homedir(), "Desktop");
   const launcherApp = path.join(desktop, `${name}.app`);
   const contents = path.join(launcherApp, "Contents");
@@ -1087,6 +1173,7 @@ function createMacLauncherApp(root, targetApp, name, options, managedUpdateHelpe
   const resources = path.join(contents, "Resources");
   const executableName = `${appSlug(name)}-launcher`;
   const userData = path.join(root, "user-data");
+  const codexHomeArg = launchCodexHome == null ? "" : `--env ${shSingle(`CODEX_HOME=${launchCodexHome}`)} `;
   fs.mkdirSync(desktop, { recursive: true });
   removeExistingOutput(launcherApp, options);
   fs.mkdirSync(macos, { recursive: true });
@@ -1119,7 +1206,7 @@ function createMacLauncherApp(root, targetApp, name, options, managedUpdateHelpe
 set -euo pipefail
 ${macManagedUpdatePrelude(managedUpdateHelper)}USER_DATA=${shSingle(userData)}
 mkdir -p "$USER_DATA"
-open -n ${shSingle(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
+open -n ${codexHomeArg}${shSingle(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
 `,
     { mode: 0o755 },
   );
@@ -1128,10 +1215,10 @@ open -n ${shSingle(targetApp)} --args --user-data-dir="$USER_DATA" "$@"
   return { type: "mac-launcher-app", path: launcherApp, status: "created", targetApp, userData };
 }
 
-function createDesktopEntry(root, targetApp, name, options, launcherInfo, managedUpdateHelper = null) {
+function createDesktopEntry(root, targetApp, name, options, launcherInfo, managedUpdateHelper = null, launchCodexHome = null) {
   if (process.platform === "darwin") {
     try {
-      return createMacLauncherApp(root, targetApp, name, options, managedUpdateHelper);
+      return createMacLauncherApp(root, targetApp, name, options, managedUpdateHelper, launchCodexHome);
     } catch (error) {
       return { type: "mac-launcher-app", path: path.join(os.homedir(), "Desktop", `${name}.app`), status: "failed", error: error.message };
     }
@@ -1174,9 +1261,9 @@ function createDesktopEntry(root, targetApp, name, options, launcherInfo, manage
   return { type: "desktop", status: "skipped" };
 }
 
-function writeLauncher(root, targetApp, name, options, managedUpdateHelper = null) {
-  if (process.platform === "darwin") return { launcher: writeMacLauncher(root, targetApp, name, options, managedUpdateHelper) };
-  if (process.platform === "win32") return writeWindowsLauncher(root, targetApp, name, options, managedUpdateHelper);
+function writeLauncher(root, targetApp, name, options, managedUpdateHelper = null, launchCodexHome = null) {
+  if (process.platform === "darwin") return { launcher: writeMacLauncher(root, targetApp, name, options, managedUpdateHelper, launchCodexHome) };
+  if (process.platform === "win32") return writeWindowsLauncher(root, targetApp, name, options, managedUpdateHelper, launchCodexHome);
   throw new Error(`Unsupported platform for launcher: ${process.platform}`);
 }
 
@@ -1669,7 +1756,8 @@ async function verifyWire(codexPath, modelCatalogPath) {
 }
 
 function dryRunPlan(opts, sourceApp, paths, modelCatalogPath, pluginMarketplace) {
-  const configPath = path.join(codexHomeDir(), "config.toml");
+  const sourceConfigPath = path.join(codexHomeDir(), "config.toml");
+  const configPath = opts.managedIsolatedConfig ? path.join(managedCodexHomePath(opts.root), "config.toml") : sourceConfigPath;
   const existingOutputs = expectedOutputPaths(opts, paths).filter((output) => fs.existsSync(output));
   return {
     dryRun: true,
@@ -1679,17 +1767,19 @@ function dryRunPlan(opts, sourceApp, paths, modelCatalogPath, pluginMarketplace)
     stateRoot: opts.root,
     modelCatalogPath,
     configPath,
+    sourceConfigPath,
     desktopLauncherRequested: opts.desktop,
     managedUpdates: opts.managedUpdates
-      ? { enabled: true, planPath: managedUpdatePlanPath(opts.root), helperPath: managedUpdateHelperPath(opts.root), configPolicy: opts.managedConfigRepair ? MANAGED_CONFIG_REPAIR_CATALOG : MANAGED_CONFIG_FAIL_CLOSED, behavior: opts.managedConfigRepair ? "The generated launchers validate/rebuild the copy and restore only the approved model_catalog_json key if another config manager changes it; all other config keys are preserved." : "The generated launchers validate source/copy app fingerprints, the managed catalog checksum, and the approved config path before launch; they rebuild/revalidate on critical drift and fail closed on config changes." }
+      ? { enabled: true, planPath: managedUpdatePlanPath(opts.root), helperPath: managedUpdateHelperPath(opts.root), configPolicy: opts.managedIsolatedConfig ? MANAGED_CONFIG_ISOLATED_CATALOG : MANAGED_CONFIG_FAIL_CLOSED, launchCodexHome: opts.managedIsolatedConfig ? managedCodexHomePath(opts.root) : codexHomeDir(), behavior: opts.managedIsolatedConfig ? "The generated launchers validate/rebuild the copy and refresh an isolated config from the external manager's current config before launch; the global config is never changed." : "The generated launchers validate source/copy app fingerprints, the managed catalog checksum, and the approved config path before launch; they rebuild/revalidate on critical drift and fail closed on config changes." }
       : { enabled: false },
     existingOutputs,
     requiresReplace: existingOutputs.length > 0,
-    globalConfigChanges: {
+    globalConfigChanges: opts.managedIsolatedConfig ? {} : {
       model_catalog_json: modelCatalogPath,
       model_reasoning_effort: "xhigh when absent",
       service_tier: "priority when absent",
     },
+    isolatedConfigChanges: opts.managedIsolatedConfig ? { model_catalog_json: modelCatalogPath, copiedFrom: sourceConfigPath } : null,
     networkRequirements: {
       modelCatalog: MODEL_CATALOG_URL,
       asarTool: `npx --yes ${ASAR_PACKAGE}`,
@@ -1719,7 +1809,8 @@ async function main() {
     if (!opts.refreshManagedCopy && !opts.managedUpdates && !opts.disableManagedUpdates && fs.existsSync(managedUpdatePlanPath(opts.root))) {
       const previousPlan = readManagedUpdatePlan(opts.root);
       opts.managedUpdates = true;
-      opts.managedConfigRepair = previousPlan.configPolicy === MANAGED_CONFIG_REPAIR_CATALOG;
+      opts.managedConfigRepair = [MANAGED_CONFIG_REPAIR_CATALOG, MANAGED_CONFIG_ISOLATED_CATALOG].includes(previousPlan.configPolicy);
+      opts.managedIsolatedConfig = opts.managedConfigRepair;
       console.log("Existing managed installation detected; preserving managed launchers. Use --disable-managed-updates to opt out explicitly.");
     }
     const sourceApp = findSourceApp(opts.sourceApp);
@@ -1764,7 +1855,10 @@ async function main() {
       if (managedCopyIsCurrent) {
         if (managedConfigState.pending) managedConfigState = ensureManagedConfigState(managedRefreshPlan, modelCatalogPath);
         fs.rmSync(managedUpdateFailurePath(opts.root), { force: true });
-        if (managedConfigState.changed) console.log(`Restored managed model_catalog_json after external config drift; backup: ${managedConfigState.backupPath ?? "none"}.`);
+        if (managedConfigState.changed) {
+          if (managedConfigState.policy === MANAGED_CONFIG_ISOLATED_CATALOG) console.log(`Refreshed the copied app's isolated Codex config from ${managedConfigState.sourceConfigPath}; global config was unchanged.`);
+          else console.log(`Restored managed model_catalog_json after external config drift; backup: ${managedConfigState.backupPath ?? "none"}.`);
+        }
         console.log(`Managed copy is current for ${sourceApp}; no rebuild was needed.`);
         return;
       }
@@ -1905,11 +1999,34 @@ async function main() {
       : opts.disableManagedUpdates
         ? removeManagedUpdateFiles(opts.root)
         : { enabled: false, status: "disabled" };
-    const launcherInfo = writeLauncher(opts.root, paths.targetApp, opts.name, opts, managedUpdates.helperPath ?? null);
-    const desktopEntry = opts.desktop ? createDesktopEntry(opts.root, paths.targetApp, opts.name, opts, launcherInfo, managedUpdates.helperPath ?? null) : { status: "skipped" };
+    const launcherInfo = writeLauncher(opts.root, paths.targetApp, opts.name, opts, managedUpdates.helperPath ?? null, managedUpdates.launchCodexHome ?? null);
+    const desktopEntry = opts.desktop ? createDesktopEntry(opts.root, paths.targetApp, opts.name, opts, launcherInfo, managedUpdates.helperPath ?? null, managedUpdates.launchCodexHome ?? null) : { status: "skipped" };
     fs.mkdirSync(path.dirname(modelCatalogReportCopy), { recursive: true });
     fs.copyFileSync(modelCatalogPath, modelCatalogReportCopy);
-    const configUpdate = managedRefreshPlan != null
+    const currentManagedConfigPlan = managedUpdates.enabled
+      ? {
+          stateRoot: opts.root,
+          codexHome: codexHomeDir(),
+          sourceConfigPath: managedUpdates.sourceConfigPath,
+          launchCodexHome: managedUpdates.launchCodexHome,
+          configPath: managedUpdates.configPath,
+          configPolicy: managedUpdates.configPolicy,
+        }
+      : null;
+    const configUpdate = currentManagedConfigPlan?.configPolicy === MANAGED_CONFIG_ISOLATED_CATALOG
+      ? (() => {
+          const refreshed = ensureManagedConfigState(currentManagedConfigPlan, modelCatalogPath);
+          return {
+            configPath: refreshed.configPath,
+            sourceConfigPath: refreshed.sourceConfigPath,
+            launchCodexHome: refreshed.launchCodexHome,
+            backupPath: null,
+            changed: refreshed.changed,
+            managedConfigPolicy: refreshed.policy,
+            previousCatalogPath: refreshed.previousCatalogPath,
+          };
+        })()
+      : managedRefreshPlan != null
       ? (() => {
           const refreshed = ensureManagedConfigState(managedRefreshPlan, modelCatalogPath);
           return {
@@ -1975,6 +2092,8 @@ async function main() {
       desktopEntry,
       appIdentity,
       configPath: configUpdate.configPath,
+      sourceConfigPath: configUpdate.sourceConfigPath ?? null,
+      launchCodexHome: configUpdate.launchCodexHome ?? null,
       configBackupPath: configUpdate.backupPath,
       configChanged: configUpdate.changed,
       managedConfigPolicy: configUpdate.managedConfigPolicy ?? null,

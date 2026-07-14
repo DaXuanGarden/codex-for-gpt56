@@ -12,6 +12,7 @@ import {
   removeManagedUpdateFiles,
   readTopLevelTomlString,
   reconcileManagedCatalogConfigText,
+  syncIsolatedCodexConfig,
 } from "../scripts/patch-codex-for-gpt56.mjs";
 
 function withJsTree(source, callback) {
@@ -144,7 +145,7 @@ test("managed refresh rebuilds when the patch-engine generation changes", () => 
   const targetFingerprint = { appAsarSha256: "d".repeat(64), codexSha256: "e".repeat(64), identitySha256: "f".repeat(64) };
   const modelCatalogSha256 = "1".repeat(64);
   const plan = {
-    version: 4,
+    version: 5,
     patchEngineVersion: "semantic-v2",
     sourceFingerprint,
     targetFingerprint,
@@ -195,19 +196,66 @@ test("explicit managed opt-out removes only managed metadata", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gpt56-managed-opt-out-"));
   const helper = process.platform === "win32" ? "refresh-managed-copy.cmd" : "refresh-managed-copy.command";
   const managedFiles = ["managed-update.json", helper, "managed-repair.mjs", "managed-update-failure.json"];
+  const managedHome = path.join(root, "codex-home");
   const unrelated = path.join(root, "keep.txt");
   try {
     for (const name of managedFiles) fs.writeFileSync(path.join(root, name), name);
+    fs.mkdirSync(managedHome);
+    fs.writeFileSync(path.join(managedHome, "config.toml"), "generated");
     fs.writeFileSync(unrelated, "keep");
 
     const result = removeManagedUpdateFiles(root);
 
     assert.equal(result.status, "disabled-explicitly");
-    assert.equal(result.removed.length, managedFiles.length);
+    assert.equal(result.removed.length, managedFiles.length + 1);
     for (const name of managedFiles) assert.equal(fs.existsSync(path.join(root, name)), false);
+    assert.equal(fs.existsSync(managedHome), false);
     assert.equal(fs.readFileSync(unrelated, "utf8"), "keep");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("isolated managed config preserves the external manager's global config", () => {
+  const sourceHome = fs.mkdtempSync(path.join(os.tmpdir(), "codex-gpt56-global-home-"));
+  const root = path.join(sourceHome, "codex-for-gpt56");
+  const isolatedHome = path.join(root, "codex-home");
+  const sourceConfigPath = path.join(sourceHome, "config.toml");
+  const modelCatalogPath = path.join(sourceHome, "model-catalog.json");
+  const authPath = path.join(sourceHome, "auth.json");
+  const before = [
+    'model_provider = "custom"',
+    'model_catalog_json = "cc-switch-model-catalog.json"',
+    '',
+    '[model_providers.custom]',
+    'base_url = "http://127.0.0.1:15721/v1"',
+    'env_key = "OPENAI_API_KEY"',
+    '',
+  ].join("\n");
+  const previousHome = process.env.CODEX_HOME;
+  try {
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(sourceConfigPath, before);
+    fs.writeFileSync(modelCatalogPath, '{"models":[]}\n');
+    fs.writeFileSync(authPath, '{}\n');
+    process.env.CODEX_HOME = sourceHome;
+    const result = syncIsolatedCodexConfig({
+      stateRoot: root,
+      codexHome: sourceHome,
+      sourceConfigPath,
+      launchCodexHome: isolatedHome,
+      configPath: path.join(isolatedHome, "config.toml"),
+    }, modelCatalogPath);
+
+    assert.equal(fs.readFileSync(sourceConfigPath, "utf8"), before);
+    const isolated = fs.readFileSync(result.configPath, "utf8");
+    assert.equal(readTopLevelTomlString(isolated, "model_catalog_json"), modelCatalogPath);
+    assert.match(isolated, /base_url = "http:\/\/127\.0\.0\.1:15721\/v1"/);
+    assert.equal(fs.realpathSync(path.join(isolatedHome, "auth.json")), fs.realpathSync(authPath));
+  } finally {
+    if (previousHome == null) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    fs.rmSync(sourceHome, { recursive: true, force: true });
   }
 });
 
